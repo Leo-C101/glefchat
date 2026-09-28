@@ -42,6 +42,7 @@ export component MainWindow inherits Window {
     in-out property <string> selected-channel-id: "";
     in-out property <string> selected-channel-name: "";
     in-out property <string> selected-channel-topic: "";
+    in-out property <bool> channel-management-open: false;
     in-out property <string> username: "";
     in-out property <bool> logged-in: false;
     in-out property <string> auth-error: "";
@@ -541,49 +542,71 @@ export component MainWindow inherits Window {
                         vertical-alignment: center;
                         overflow: elide;
                     }
+
+                    if root.account-role != "Member" : Button {
+                        text: root.channel-management-open ? "Close management" : "Manage channels";
+                        clicked => { root.channel-management-open = !root.channel-management-open; }
+                    }
                 }
 
-                if root.account-role != "Member" : HorizontalBox {
-                    spacing: 8px;
+                if root.account-role != "Member" && root.channel-management-open : Rectangle {
+                    background: root.theme-colors[21].value;
+                    border-radius: 8px;
 
-                    channel_name_input := LineEdit {
-                        width: 160px;
-                        placeholder-text: "Channel name";
-                        text: root.selected-channel-name;
-                    }
+                    VerticalBox {
+                        padding: 10px;
+                        spacing: 8px;
 
-                    channel_topic_input := LineEdit {
-                        width: 220px;
-                        placeholder-text: "Channel topic";
-                        text: root.selected-channel-topic;
-                    }
-
-                    Button {
-                        text: "Save";
-                        enabled: root.selected-channel-id != "";
-                        clicked => {
-                            root.edit-channel(root.selected-channel-id, channel_name_input.text, channel_topic_input.text);
+                        Text {
+                            text: "Manage channels";
+                            color: root.theme-colors[13].value;
+                            font-size: 14px;
+                            font-weight: 700;
                         }
-                    }
-                }
 
-                if root.account-role != "Member" : HorizontalBox {
-                    spacing: 8px;
+                        HorizontalBox {
+                            spacing: 8px;
 
-                    new_channel_name_input := LineEdit {
-                        width: 160px;
-                        placeholder-text: "New channel name";
-                    }
+                            channel_name_input := LineEdit {
+                                width: 160px;
+                                placeholder-text: "Channel name";
+                                text: root.selected-channel-name;
+                            }
 
-                    new_channel_topic_input := LineEdit {
-                        width: 220px;
-                        placeholder-text: "New channel topic";
-                    }
+                            channel_topic_input := LineEdit {
+                                width: 220px;
+                                placeholder-text: "Channel topic";
+                                text: root.selected-channel-topic;
+                            }
 
-                    Button {
-                        text: "Create";
-                        clicked => {
-                            root.create-channel(new_channel_name_input.text, new_channel_topic_input.text);
+                            Button {
+                                text: "Save";
+                                enabled: root.selected-channel-id != "";
+                                clicked => {
+                                    root.edit-channel(root.selected-channel-id, channel_name_input.text, channel_topic_input.text);
+                                }
+                            }
+                        }
+
+                        HorizontalBox {
+                            spacing: 8px;
+
+                            new_channel_name_input := LineEdit {
+                                width: 160px;
+                                placeholder-text: "New channel name";
+                            }
+
+                            new_channel_topic_input := LineEdit {
+                                width: 220px;
+                                placeholder-text: "New channel topic";
+                            }
+
+                            Button {
+                                text: "Create";
+                                clicked => {
+                                    root.create-channel(new_channel_name_input.text, new_channel_topic_input.text);
+                                }
+                            }
                         }
                     }
                 }
