@@ -1,9 +1,13 @@
-use argon2::Argon2;
-use argon2::password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash};
 use base64::Engine;
-use protocol::{
+use oxide_rs::auth::{hash_password, verify_password};
+use oxide_rs::protocol;
+use oxide_rs::protocol::{
     Channel, ChatServer, ChatServerView, ClientMessage, DEFAULT_CHAT_SERVER_ID,
-    MAX_PROFILE_IMAGE_SIZE, Permission, ServerMessage, UserProfile, UserRole,
+    MAX_VOICE_PACKET_BYTES, Permission, ServerMessage, UserProfile, UserRole, VOICE_SAMPLE_RATE,
+};
+use oxide_rs::validation::{
+    MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH, parse_admin_usernames, valid_channel_name,
+    valid_channel_topic, valid_chat_server_name, valid_profile_image, valid_username,
 };
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -19,19 +23,12 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore, broadcast};
 use tokio_rustls::TlsAcceptor;
 
-#[path = "../protocol.rs"]
-mod protocol;
-
-const MIN_PASSWORD_LENGTH: usize = 8;
-const MAX_PASSWORD_LENGTH: usize = 1024;
 const MAX_MESSAGE_LENGTH: usize = 4096;
 const MAX_REQUEST_LENGTH: usize = 1_500_000;
+const MAX_VOICE_FRAME_BASE64_LENGTH: usize = 1_700;
 const MAX_CONNECTIONS: usize = 128;
 const MAX_CHANNELS: usize = 100;
 const MAX_CHAT_SERVER_MEMBERS: usize = 100;
-const MAX_CHANNEL_NAME_LENGTH: usize = 32;
-const MAX_CHANNEL_TOPIC_LENGTH: usize = 160;
-const MAX_CHAT_SERVER_NAME_LENGTH: usize = 32;
 
 fn default_chat_server() -> ChatServer {
     ChatServer {
@@ -93,6 +90,13 @@ enum Broadcast {
         author: String,
         content: String,
     },
+    VoiceFrame {
+        server_id: String,
+        channel_id: String,
+        author: String,
+        sample_rate: u32,
+        audio: String,
+    },
     Channels {
         server_id: String,
         channels: Vec<Channel>,
@@ -145,29 +149,6 @@ impl Drop for OnlinePresence {
     fn drop(&mut self) {
         self.left();
     }
-}
-
-fn valid_profile_image(image: &Option<String>) -> bool {
-    image.as_ref().is_none_or(|image| {
-        base64::engine::general_purpose::STANDARD
-            .decode(image)
-            .is_ok_and(|bytes| !bytes.is_empty() && bytes.len() <= MAX_PROFILE_IMAGE_SIZE)
-    })
-}
-
-fn valid_channel_name(name: &str) -> bool {
-    (1..=MAX_CHANNEL_NAME_LENGTH).contains(&name.len())
-        && name.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
-        })
-}
-
-fn valid_channel_topic(topic: &str) -> bool {
-    topic.len() <= MAX_CHANNEL_TOPIC_LENGTH && !topic.chars().any(char::is_control)
-}
-
-fn valid_chat_server_name(name: &str) -> bool {
-    (2..=MAX_CHAT_SERVER_NAME_LENGTH).contains(&name.len()) && !name.chars().any(char::is_control)
 }
 
 fn chat_server_views(store: &UserStore, username: &str) -> Vec<ChatServerView> {
@@ -257,15 +238,6 @@ fn user_profile(store: &UserStore, username: &str) -> UserProfile {
     profile.role = store.roles.get(username).copied().unwrap_or_default();
     profile.banned = store.banned_users.contains(username);
     profile
-}
-
-fn parse_admin_usernames(value: &str) -> HashSet<String> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|username| valid_username(username))
-        .map(str::to_string)
-        .collect()
 }
 
 fn configured_admin_usernames() -> HashSet<String> {
@@ -472,27 +444,6 @@ fn tls_acceptor_with_paths(cert_path: &Path, key_path: &Path) -> io::Result<TlsA
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
-fn valid_username(username: &str) -> bool {
-    (3..=32).contains(&username.len())
-        && username
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-}
-
-fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
-    Argon2::default()
-        .hash_password(password.as_bytes())
-        .map(|hash| hash.to_string())
-}
-
-fn verify_password(password: &str, hash: &str) -> bool {
-    PasswordHash::new(hash).is_ok_and(|parsed| {
-        Argon2::default()
-            .verify_password(password.as_bytes(), &parsed)
-            .is_ok()
-    })
-}
-
 fn new_session_token() -> io::Result<String> {
     let key = rcgen::KeyPair::generate().map_err(io::Error::other)?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.serialize_der()))
@@ -583,6 +534,7 @@ async fn handle_connection(
     let mut authenticated_user: Option<String> = None;
     let mut authenticated_session_hash: Option<String> = None;
     let mut active_server_id: Option<String> = None;
+    let mut active_channel_id: Option<String> = None;
     let mut presence = OnlinePresence::new(tx.clone());
 
     loop {
@@ -868,6 +820,7 @@ async fn handle_connection(
                         authenticated_user = None;
                         authenticated_session_hash = None;
                         active_server_id = None;
+                        active_channel_id = None;
                         send_response(&mut writer, ServerMessage::LoggedOut).await?;
                     }
                     ClientMessage::CreateChatServer { name, icon } => {
@@ -1057,6 +1010,25 @@ async fn handle_connection(
                             channels,
                         }).await?;
                     }
+                    ClientMessage::SelectChannel { server_id, channel_id } => {
+                        let Some(username) = authenticated_user.as_ref() else {
+                            continue;
+                        };
+                        let store = users.lock().await;
+                        let is_member = store.server_members.get(&server_id)
+                            .is_some_and(|members| members.contains(username));
+                        let channel_exists = store.channels.iter()
+                            .any(|channel| channel.server_id == server_id && channel.id == channel_id);
+                        if active_server_id.as_deref() == Some(server_id.as_str())
+                            && is_member
+                            && channel_exists
+                        {
+                            active_channel_id = Some(channel_id);
+                        }
+                    }
+                    ClientMessage::LeaveVoice => {
+                        active_channel_id = None;
+                    }
                     ClientMessage::SendMessage { server_id, channel_id, content } => {
                         let Some(author) = authenticated_user.as_ref() else {
                             send_response(&mut writer, ServerMessage::AuthenticationFailed {
@@ -1085,6 +1057,38 @@ async fn handle_connection(
                                 channel_id,
                                 author: author.clone(),
                                 content,
+                            });
+                        }
+                    }
+                    ClientMessage::VoiceFrame { server_id, channel_id, sample_rate, audio } => {
+                        let Some(author) = authenticated_user.as_ref() else {
+                            continue;
+                        };
+                        if active_server_id.as_deref() != Some(server_id.as_str())
+                            || active_channel_id.as_deref() != Some(channel_id.as_str())
+                            || sample_rate != VOICE_SAMPLE_RATE
+                            || audio.len() > MAX_VOICE_FRAME_BASE64_LENGTH
+                        {
+                            continue;
+                        }
+                        let Ok(pcm) = base64::engine::general_purpose::STANDARD.decode(&audio) else {
+                            continue;
+                        };
+                        if pcm.is_empty() || pcm.len() > MAX_VOICE_PACKET_BYTES {
+                            continue;
+                        }
+                        let store = users.lock().await;
+                        let is_member = store.server_members.get(&server_id)
+                            .is_some_and(|members| members.contains(author));
+                        let channel_exists = store.channels.iter()
+                            .any(|channel| channel.server_id == server_id && channel.id == channel_id);
+                        if is_member && channel_exists {
+                            let _ = tx.send(Broadcast::VoiceFrame {
+                                server_id,
+                                channel_id,
+                                author: author.clone(),
+                                sample_rate,
+                                audio,
                             });
                         }
                     }
@@ -1363,6 +1367,19 @@ async fn handle_connection(
                             send_response(&mut writer, ServerMessage::ChatMessage { server_id, channel_id, author, content }).await?;
                         }
                     }
+                    Ok(Broadcast::VoiceFrame { server_id, channel_id, author, sample_rate, audio }) => {
+                        if active_server_id.as_deref() == Some(server_id.as_str())
+                            && active_channel_id.as_deref() == Some(channel_id.as_str())
+                        {
+                            send_response(&mut writer, ServerMessage::VoiceFrame {
+                                server_id,
+                                channel_id,
+                                author,
+                                sample_rate,
+                                audio,
+                            }).await?;
+                        }
+                    }
                     Ok(Broadcast::Channels { server_id, channels }) => {
                         if active_server_id.as_deref() == Some(server_id.as_str()) {
                             send_response(&mut writer, ServerMessage::Channels { server_id, channels }).await?;
@@ -1418,15 +1435,19 @@ mod tests {
     use super::{
         UserStore, add_chat_server_member, can_moderate_user, default_channels,
         default_chat_server, default_next_channel_id, default_next_chat_server_id,
-        handle_connection, hash_password, parse_admin_usernames, role_change_error,
-        tls_acceptor_with_paths, valid_channel_name, valid_channel_topic, valid_profile_image,
-        valid_username, verify_password,
+        handle_connection, role_change_error, tls_acceptor_with_paths,
     };
-    use crate::protocol::{
-        ClientMessage, DEFAULT_CHANNEL_ID, DEFAULT_CHAT_SERVER_ID, ServerMessage, UserProfile,
-    };
-    use crate::protocol::{MAX_PROFILE_IMAGE_SIZE, Permission, UserRole};
     use base64::Engine;
+    use oxide_rs::auth::{hash_password, verify_password};
+    use oxide_rs::protocol::{
+        ClientMessage, DEFAULT_CHANNEL_ID, DEFAULT_CHAT_SERVER_ID, ServerMessage, UserProfile,
+        VOICE_SAMPLE_RATE,
+    };
+    use oxide_rs::protocol::{MAX_PROFILE_IMAGE_SIZE, Permission, UserRole};
+    use oxide_rs::validation::{
+        parse_admin_usernames, valid_channel_name, valid_channel_topic, valid_profile_image,
+        valid_username,
+    };
     use rustls::pki_types::ServerName;
     use rustls::{ClientConfig, RootCertStore};
     use serde::Serialize;
@@ -2101,7 +2122,7 @@ mod tests {
             &mut bob_writer,
             &ClientMessage::SendMessage {
                 server_id: side_server_id.clone(),
-                channel_id: side_channel_id,
+                channel_id: side_channel_id.clone(),
                 content: "community-only message".to_string(),
             },
         )
@@ -2113,6 +2134,104 @@ mod tests {
             ServerMessage::ChatMessage { server_id, author, .. }
                 if server_id == side_server_id && author == "bob"
         ));
+
+        let voice_frame = base64::engine::general_purpose::STANDARD.encode([0_u8; 640]);
+        for (writer, username) in [(&mut writer, "alice"), (&mut bob_writer, "bob")] {
+            send_message(
+                writer,
+                &ClientMessage::SelectChannel {
+                    server_id: side_server_id.clone(),
+                    channel_id: side_channel_id.clone(),
+                },
+            )
+            .await?;
+            send_message(
+                writer,
+                &ClientMessage::VoiceFrame {
+                    server_id: side_server_id.clone(),
+                    channel_id: side_channel_id.clone(),
+                    sample_rate: VOICE_SAMPLE_RATE,
+                    audio: voice_frame.clone(),
+                },
+            )
+            .await?;
+            let reader = if username == "alice" {
+                &mut reader
+            } else {
+                &mut bob_reader
+            };
+            assert!(matches!(
+                read_until(reader, |message| matches!(message,
+                    ServerMessage::VoiceFrame { author, .. } if author == username
+                ))
+                .await?,
+                ServerMessage::VoiceFrame { .. }
+            ));
+        }
+
+        send_message(
+            &mut writer,
+            &ClientMessage::VoiceFrame {
+                server_id: side_server_id.clone(),
+                channel_id: side_channel_id.clone(),
+                sample_rate: VOICE_SAMPLE_RATE,
+                audio: voice_frame.clone(),
+            },
+        )
+        .await?;
+        assert!(matches!(
+            read_until(&mut bob_reader, |message| matches!(
+                message,
+                ServerMessage::VoiceFrame { author, .. } if author == "alice"
+            ))
+            .await?,
+            ServerMessage::VoiceFrame { .. }
+        ));
+
+        send_message(
+            &mut writer,
+            &ClientMessage::VoiceFrame {
+                server_id: side_server_id.clone(),
+                channel_id: DEFAULT_CHANNEL_ID.to_string(),
+                sample_rate: VOICE_SAMPLE_RATE,
+                audio: voice_frame.clone(),
+            },
+        )
+        .await?;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(150),
+                read_until(&mut bob_reader, |message| matches!(
+                    message,
+                    ServerMessage::VoiceFrame { author, .. } if author == "alice"
+                )),
+            )
+            .await
+            .is_err()
+        );
+
+        send_message(&mut bob_writer, &ClientMessage::LeaveVoice).await?;
+        send_message(
+            &mut writer,
+            &ClientMessage::VoiceFrame {
+                server_id: side_server_id.clone(),
+                channel_id: side_channel_id.clone(),
+                sample_rate: VOICE_SAMPLE_RATE,
+                audio: voice_frame,
+            },
+        )
+        .await?;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(150),
+                read_until(&mut bob_reader, |message| matches!(
+                    message,
+                    ServerMessage::VoiceFrame { author, .. } if author == "alice"
+                )),
+            )
+            .await
+            .is_err()
+        );
 
         send_message(&mut bob_writer, &ClientMessage::Logout).await?;
         assert!(matches!(

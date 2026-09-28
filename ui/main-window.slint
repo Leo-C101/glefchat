@@ -64,6 +64,7 @@ export component MainWindow inherits Window {
     in-out property <string> auth-error: "";
     in-out property <[ThemeColor]> theme-colors;
     in-out property <[ThemeColor]> editable-theme-colors;
+    in-out property <string> theme-preset: "Mocha";
     in-out property <string> accent-name: "Lavender";
     in-out property <bool> theme-editor-open: false;
     in-out property <bool> profile-editor-open: false;
@@ -82,7 +83,10 @@ export component MainWindow inherits Window {
     in-out property <image> viewed-profile-banner;
     in-out property <bool> follow-chat-bottom: true;
     in-out property <int> chat-scroll-request: 0;
+    in-out property <bool> voice-active: false;
+    in-out property <string> voice-error: "";
     callback send-message(string);
+    callback toggle-voice-chat(bool);
     callback select-channel(string);
     callback select-chat-server(string);
     callback create-chat-server(string, bool);
@@ -95,6 +99,7 @@ export component MainWindow inherits Window {
     callback log-out();
     callback set-theme-color(int, string);
     callback set-theme-accent(string);
+    callback set-theme-preset(string);
     callback choose-profile-picture();
     callback choose-profile-banner();
     callback show-user-profile(string);
@@ -369,6 +374,26 @@ export component MainWindow inherits Window {
                     spacing: 10px;
 
                     Text {
+                        text: "Theme preset";
+                        width: 140px;
+                        color: root.theme-colors[14].value;
+                        vertical-alignment: center;
+                    }
+
+                    ComboBox {
+                        model: ["Mocha", "Latte", "Nord", "Forest", "Custom"];
+                        current-value: root.theme-preset;
+                        selected(value) => {
+                            root.set-theme-preset(value);
+                        }
+                    }
+                }
+
+                HorizontalBox {
+                    height: 42px;
+                    spacing: 10px;
+
+                    Text {
                         text: "Preferred accent";
                         width: 140px;
                         color: root.theme-colors[14].value;
@@ -510,76 +535,78 @@ export component MainWindow inherits Window {
             spacing: 14px;
 
             Rectangle {
-                width: 76px;
+                width: 64px;
+                vertical-stretch: 1;
                 background: root.theme-colors[23].value;
                 border-radius: 10px;
 
-                VerticalBox {
-                    padding: 8px;
-                    spacing: 9px;
-                    alignment: center;
+                ScrollView {
+                    x: 8px;
+                    y: 8px;
+                    width: 48px;
+                    height: parent.height - 67px;
 
-                    ScrollView {
-                        VerticalBox {
-                            spacing: 9px;
+                    VerticalBox {
+                        spacing: 9px;
+                        alignment: center;
+
+                        for server in root.chat-servers : VerticalBox {
+                            spacing: 3px;
                             alignment: center;
 
-                            for server in root.chat-servers : VerticalBox {
-                                spacing: 3px;
-                                alignment: center;
+                            Rectangle {
+                                width: 48px;
+                                height: 48px;
+                                background: root.theme-colors[21].value;
+                                border-radius: 24px;
+                                border-width: server.id == root.selected-chat-server-id ? 2px : 0px;
+                                border-color: root.theme-colors[13].value;
+                                clip: true;
 
-                                Rectangle {
-                                    width: 48px;
-                                    height: 48px;
-                                    background: root.theme-colors[21].value;
-                                    border-radius: 24px;
-                                    border-width: server.id == root.selected-chat-server-id ? 2px : 0px;
-                                    border-color: root.theme-colors[13].value;
-                                    clip: true;
-
-                                    if server.has-icon : Image {
-                                        source: server.icon;
-                                        width: parent.width;
-                                        height: parent.height;
-                                        image-fit: cover;
-                                    }
-
-                                    if !server.has-icon : Text {
-                                        text: "●";
-                                        color: root.theme-colors[13].value;
-                                        font-size: 22px;
-                                        horizontal-alignment: center;
-                                        vertical-alignment: center;
-                                    }
-
-                                    TouchArea {
-                                        width: parent.width;
-                                        height: parent.height;
-                                        enabled: server.is-member || server.member-count < 100;
-                                        clicked => { root.select-chat-server(server.id); }
-                                    }
+                                if server.has-icon : Image {
+                                    source: server.icon;
+                                    width: parent.width;
+                                    height: parent.height;
+                                    image-fit: cover;
                                 }
 
-                                Text {
-                                    text: server.name;
-                                    width: 60px;
-                                    font-size: 10px;
-                                    color: root.theme-colors[14].value;
+                                if !server.has-icon : Text {
+                                    text: "●";
+                                    color: root.theme-colors[13].value;
+                                    font-size: 22px;
                                     horizontal-alignment: center;
-                                    overflow: elide;
+                                    vertical-alignment: center;
                                 }
+
+                                TouchArea {
+                                    width: parent.width;
+                                    height: parent.height;
+                                    enabled: server.is-member || server.member-count < 100;
+                                    clicked => { root.select-chat-server(server.id); }
+                                }
+                            }
+
+                            Text {
+                                text: server.name;
+                                width: 48px;
+                                font-size: 10px;
+                                color: root.theme-colors[14].value;
+                                horizontal-alignment: center;
+                                overflow: elide;
                             }
                         }
                     }
+                }
 
-                    Button {
-                        text: "+";
-                        width: 48px;
-                        height: 42px;
-                        clicked => {
-                            root.server-creation-open = !root.server-creation-open;
-                            root.server-icon-error = "";
-                        }
+                Button {
+                    x: 8px;
+                    y: parent.height - 50px;
+                    width: 48px;
+                    height: 42px;
+                    text: "+";
+                    clicked => {
+                        root.server-creation-open = !root.server-creation-open;
+                        root.server-icon-error = "";
                     }
                 }
             }
@@ -675,6 +702,8 @@ export component MainWindow inherits Window {
                     }
 
                     if !root.server-creation-open : ScrollView {
+                        vertical-stretch: 1;
+
                         VerticalBox {
                             spacing: 4px;
 
@@ -948,6 +977,23 @@ export component MainWindow inherits Window {
                                 root.send-message(input.text);
                                 input.text = "";
                             }
+                        }
+
+                        Button {
+                            text: root.voice-active ? "Leave voice" : "Join voice";
+                            height: 36px;
+                            clicked => {
+                                root.toggle-voice-chat(!root.voice-active);
+                            }
+                        }
+
+                        if root.voice-error != "" : Text {
+                            text: root.voice-error;
+                            width: 150px;
+                            color: root.theme-colors[4].value;
+                            font-size: 11px;
+                            vertical-alignment: center;
+                            overflow: elide;
                         }
                     }
                 }

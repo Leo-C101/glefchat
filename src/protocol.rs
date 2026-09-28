@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 pub const MAX_PROFILE_IMAGE_SIZE: usize = 512 * 1024;
 pub const DEFAULT_CHANNEL_ID: &str = "1";
 pub const DEFAULT_CHAT_SERVER_ID: &str = "1";
+pub const VOICE_SAMPLE_RATE: u32 = 48_000;
+pub const MAX_VOICE_PACKET_BYTES: usize = 1_275;
 
 pub fn default_channel_id() -> String {
     DEFAULT_CHANNEL_ID.to_string()
@@ -119,12 +121,23 @@ pub enum ClientMessage {
     LeaveChatServer {
         server_id: String,
     },
+    SelectChannel {
+        server_id: String,
+        channel_id: String,
+    },
+    LeaveVoice,
     SendMessage {
         #[serde(default = "default_chat_server_id")]
         server_id: String,
         #[serde(default = "default_channel_id")]
         channel_id: String,
         content: String,
+    },
+    VoiceFrame {
+        server_id: String,
+        channel_id: String,
+        sample_rate: u32,
+        audio: String,
     },
     CreateChannel {
         name: String,
@@ -191,6 +204,13 @@ pub enum ServerMessage {
         channel_id: String,
         author: String,
         content: String,
+    },
+    VoiceFrame {
+        server_id: String,
+        channel_id: String,
+        author: String,
+        sample_rate: u32,
+        audio: String,
     },
     Channels {
         #[serde(default = "default_chat_server_id")]

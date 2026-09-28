@@ -1,6 +1,9 @@
 use base64::Engine;
-use protocol::{ClientMessage, ServerMessage};
-use protocol::{MAX_PROFILE_IMAGE_SIZE, UserProfile, UserRole};
+use oxide_rs::protocol;
+use oxide_rs::protocol::{ClientMessage, ServerMessage};
+use oxide_rs::protocol::{MAX_PROFILE_IMAGE_SIZE, UserProfile, UserRole};
+use oxide_rs::validation::valid_username;
+use oxide_rs::voice::VoiceChat;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
 use serde::{Deserialize, Serialize};
@@ -17,7 +20,6 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
 
-mod protocol;
 fn user_role_from_label(label: &str) -> Option<UserRole> {
     match label {
         "Member" => Some(UserRole::Member),
@@ -133,6 +135,61 @@ const EDITABLE_THEME: [(&str, &str); 8] = [
     ("surface2", "Raised surface"),
 ];
 
+const THEME_PRESETS: [(&str, [(&str, &str); 8]); 4] = [
+    (
+        "Mocha",
+        [
+            ("base", "#1e1e2eca"),
+            ("surface0", "#313244e0"),
+            ("mantle", "#181825"),
+            ("surface1", "#45475a"),
+            ("text", "#cdd6f4"),
+            ("subtext0", "#a6adc8"),
+            ("overlay0", "#6c7086"),
+            ("surface2", "#585b70"),
+        ],
+    ),
+    (
+        "Latte",
+        [
+            ("base", "#eff1f5"),
+            ("surface0", "#e6e9ef"),
+            ("mantle", "#dce0e8"),
+            ("surface1", "#ccd0da"),
+            ("text", "#4c4f69"),
+            ("subtext0", "#6c6f85"),
+            ("overlay0", "#9ca0b0"),
+            ("surface2", "#bcc0cc"),
+        ],
+    ),
+    (
+        "Nord",
+        [
+            ("base", "#2e3440"),
+            ("surface0", "#3b4252"),
+            ("mantle", "#242933"),
+            ("surface1", "#434c5e"),
+            ("text", "#eceff4"),
+            ("subtext0", "#d8dee9"),
+            ("overlay0", "#7b88a1"),
+            ("surface2", "#4c566a"),
+        ],
+    ),
+    (
+        "Forest",
+        [
+            ("base", "#17231e"),
+            ("surface0", "#20332a"),
+            ("mantle", "#101a15"),
+            ("surface1", "#2b4035"),
+            ("text", "#e1eee5"),
+            ("subtext0", "#b2c9ba"),
+            ("overlay0", "#718c7c"),
+            ("surface2", "#385344"),
+        ],
+    ),
+];
+
 const ACCENT_KEYS: [&str; 14] = [
     "rosewater",
     "flamingo",
@@ -162,6 +219,41 @@ const ACCENT_OPTIONS: [(&str, &str); 8] = [
 ];
 
 const PREFERRED_ACCENT_KEY: &str = "__preferred_accent";
+const THEME_PRESET_KEY: &str = "__theme_preset";
+
+fn apply_theme_preset(overrides: &mut HashMap<String, String>, preset: &str) -> bool {
+    let Some((_, colors)) = THEME_PRESETS.iter().find(|(name, _)| *name == preset) else {
+        return false;
+    };
+    for &(key, value) in colors {
+        overrides.insert(key.to_string(), value.to_string());
+    }
+    overrides.insert(THEME_PRESET_KEY.to_string(), preset.to_string());
+    true
+}
+
+fn selected_theme_preset(overrides: Option<&HashMap<String, String>>) -> &'static str {
+    if let Some(preset) = overrides
+        .and_then(|overrides| overrides.get(THEME_PRESET_KEY))
+        .and_then(|selected| {
+            THEME_PRESETS
+                .iter()
+                .find(|(name, _)| *name == selected)
+                .map(|(name, _)| *name)
+        })
+    {
+        return preset;
+    }
+    if overrides.is_some_and(|overrides| {
+        EDITABLE_THEME
+            .iter()
+            .any(|(key, _)| overrides.contains_key(*key))
+    }) {
+        "Custom"
+    } else {
+        "Mocha"
+    }
+}
 
 fn parse_theme_color(value: &str) -> Option<(String, Color)> {
     let hex = value.trim().strip_prefix('#').unwrap_or(value.trim());
@@ -339,13 +431,6 @@ fn tls_connector() -> io::Result<TlsConnector> {
     Ok(TlsConnector::from(Arc::new(config)))
 }
 
-fn valid_username(username: &str) -> bool {
-    (3..=32).contains(&username.len())
-        && username
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-}
-
 fn main() -> Result<(), slint::PlatformError> {
     let main_window = MainWindow::new()?;
 
@@ -383,6 +468,9 @@ fn main() -> Result<(), slint::PlatformError> {
         .expect("failed to create tokio runtime");
 
     let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel::<ClientMessage>();
+    let (voice_control_tx, voice_control_rx) = mpsc::unbounded_channel::<ClientMessage>();
+    let (voice_tx, voice_rx) = mpsc::channel::<ClientMessage>(8);
+    let voice_chat = Arc::new(Mutex::new(None::<VoiceChat>));
 
     if let Err(err) = save_user_store(&user_store.lock().unwrap()) {
         eprintln!("failed to migrate local preferences: {err}");
@@ -392,6 +480,9 @@ fn main() -> Result<(), slint::PlatformError> {
         main_window.as_weak(),
         user_store.clone(),
         stored_messages.clone(),
+        voice_chat.clone(),
+        voice_control_rx,
+        voice_rx,
         outgoing_tx.clone(),
         outgoing_rx,
     ));
@@ -455,9 +546,13 @@ fn main() -> Result<(), slint::PlatformError> {
         let window = main_window.as_weak();
         let user_store = user_store.clone();
         let outgoing_tx = outgoing_tx.clone();
+        let voice_chat = voice_chat.clone();
         main_window.on_log_out(move || {
             let Some(win) = window.upgrade() else { return };
             let _ = outgoing_tx.send(ClientMessage::Logout);
+            voice_chat.lock().unwrap().take();
+            win.set_voice_active(false);
+            win.set_voice_error("".into());
             let mut store = user_store.lock().unwrap();
             store.session = None;
             if let Err(err) = save_user_store(&store) {
@@ -472,6 +567,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 None,
             ))));
             win.set_accent_name(ACCENT_OPTIONS[0].0.into());
+            win.set_theme_preset("Mocha".into());
         });
     }
 
@@ -517,11 +613,39 @@ fn main() -> Result<(), slint::PlatformError> {
 
             let username = win.get_username().to_string();
             let mut store = user_store.lock().unwrap();
-            store
-                .themes
-                .entry(username)
-                .or_default()
-                .insert(colors.row_data(index).unwrap().key.to_string(), normalized);
+            let overrides = store.themes.entry(username).or_default();
+            overrides.insert(colors.row_data(index).unwrap().key.to_string(), normalized);
+            overrides.insert(THEME_PRESET_KEY.to_string(), "Custom".to_string());
+            win.set_theme_preset("Custom".into());
+            if let Err(err) = save_user_store(&store) {
+                eprintln!("failed to save user theme: {err}");
+                win.set_theme_error("Theme updated, but could not be saved.".into());
+            }
+        });
+    }
+
+    {
+        let window = main_window.as_weak();
+        let user_store = user_store.clone();
+        main_window.on_set_theme_preset(move |preset| {
+            let Some(win) = window.upgrade() else { return };
+            let preset = preset.to_string();
+            if preset == "Custom" {
+                return;
+            }
+
+            let username = win.get_username().to_string();
+            let mut store = user_store.lock().unwrap();
+            let overrides = store.themes.entry(username).or_default();
+            if !apply_theme_preset(overrides, &preset) {
+                return;
+            }
+            win.set_theme_preset(preset.into());
+            win.set_theme_colors(ModelRc::new(VecModel::from(theme_colors(Some(overrides)))));
+            win.set_editable_theme_colors(ModelRc::new(VecModel::from(editable_theme_colors(
+                Some(overrides),
+            ))));
+            win.set_theme_error("".into());
             if let Err(err) = save_user_store(&store) {
                 eprintln!("failed to save user theme: {err}");
                 win.set_theme_error("Theme updated, but could not be saved.".into());
@@ -670,8 +794,51 @@ fn main() -> Result<(), slint::PlatformError> {
 
     {
         let window = main_window.as_weak();
+        let voice_control_tx = voice_control_tx.clone();
+        let voice_tx = voice_tx.clone();
+        let voice_chat = voice_chat.clone();
+        main_window.on_toggle_voice_chat(move |enabled| {
+            let Some(win) = window.upgrade() else { return };
+            if !enabled {
+                voice_chat.lock().unwrap().take();
+                win.set_voice_active(false);
+                win.set_voice_error("".into());
+                return;
+            }
+            if !win.get_logged_in() {
+                win.set_voice_error("Sign in before joining voice.".into());
+                return;
+            }
+            let server_id = win.get_selected_chat_server_id().to_string();
+            let channel_id = win.get_selected_channel_id().to_string();
+            if server_id.is_empty() || channel_id.is_empty() {
+                win.set_voice_error("Select a channel first.".into());
+                return;
+            }
+            match VoiceChat::start(
+                server_id,
+                channel_id,
+                voice_control_tx.clone(),
+                voice_tx.clone(),
+            ) {
+                Ok(voice) => {
+                    *voice_chat.lock().unwrap() = Some(voice);
+                    win.set_voice_active(true);
+                    win.set_voice_error("".into());
+                }
+                Err(error) => {
+                    win.set_voice_active(false);
+                    win.set_voice_error(error.into());
+                }
+            }
+        });
+    }
+
+    {
+        let window = main_window.as_weak();
         let stored_messages = stored_messages.clone();
         let user_store = user_store.clone();
+        let voice_chat = voice_chat.clone();
         main_window.on_select_channel(move |name| {
             let Some(win) = window.upgrade() else { return };
             let channels = win.get_channels();
@@ -681,6 +848,11 @@ fn main() -> Result<(), slint::PlatformError> {
             win.set_selected_channel_id(channel.id.clone());
             win.set_selected_channel_name(channel.name.clone());
             win.set_selected_channel_topic(channel.topic.clone());
+            let server_id = win.get_selected_chat_server_id().to_string();
+            let channel_id = channel.id.to_string();
+            if let Some(voice) = voice_chat.lock().unwrap().as_ref() {
+                voice.retarget(server_id, channel_id);
+            }
             refresh_visible_messages(&win, &stored_messages, &user_store);
         });
     }
@@ -948,6 +1120,9 @@ async fn connect_to_server(
     window: Weak<MainWindow>,
     user_store: Arc<Mutex<UserStore>>,
     stored_messages: Arc<Mutex<Vec<StoredMessage>>>,
+    voice_chat: Arc<Mutex<Option<VoiceChat>>>,
+    mut voice_control_rx: mpsc::UnboundedReceiver<ClientMessage>,
+    mut voice_rx: mpsc::Receiver<ClientMessage>,
     outgoing_tx: mpsc::UnboundedSender<ClientMessage>,
     mut outgoing_rx: mpsc::UnboundedReceiver<ClientMessage>,
 ) {
@@ -1011,6 +1186,22 @@ async fn connect_to_server(
     }
     loop {
         tokio::select! {
+            biased;
+            command = voice_control_rx.recv() => {
+                let Some(command) = command else { continue };
+                let mut line = match serde_json::to_vec(&command) {
+                    Ok(line) => line,
+                    Err(err) => {
+                        eprintln!("failed to encode voice control: {err}");
+                        continue;
+                    }
+                };
+                line.push(b'\n');
+                if let Err(err) = write_half.write_all(&line).await {
+                    eprintln!("failed to send voice control: {err}");
+                    break;
+                }
+            }
             command = outgoing_rx.recv() => {
                 let Some(command) = command else { break };
                 let mut line = match serde_json::to_vec(&command) {
@@ -1024,6 +1215,22 @@ async fn connect_to_server(
                 if let Err(err) = write_half.write_all(&line).await {
                     eprintln!("failed to send chat request: {err}");
                     break;
+                }
+            }
+            command = voice_rx.recv() => {
+                if let Some(command) = command {
+                    let mut line = match serde_json::to_vec(&command) {
+                        Ok(line) => line,
+                        Err(err) => {
+                            eprintln!("failed to encode voice frame: {err}");
+                            continue;
+                        }
+                    };
+                    line.push(b'\n');
+                    if let Err(err) = write_half.write_all(&line).await {
+                        eprintln!("failed to send voice frame: {err}");
+                        break;
+                    }
                 }
             }
             result = lines.next_line() => {
@@ -1064,6 +1271,37 @@ async fn connect_to_server(
                                         });
                                     }
                                 }
+                                ServerMessage::Channels { server_id, channels } => {
+                                    let selected_channel = window.upgrade()
+                                        .and_then(|window| {
+                                            let selected = window.get_selected_channel_id().to_string();
+                                            channels.iter()
+                                                .find(|channel| channel.id == selected)
+                                                .or_else(|| channels.first())
+                                                .map(|channel| channel.id.clone())
+                                        });
+                                    if let Some(channel_id) = selected_channel {
+                                        if let Some(voice) = voice_chat.lock().unwrap().as_ref() {
+                                            voice.retarget(server_id.clone(), channel_id);
+                                        }
+                                    }
+                                }
+                                ServerMessage::VoiceFrame { author, sample_rate, audio, .. } => {
+                                    let is_self = window.upgrade()
+                                        .is_some_and(|window| window.get_username().as_str() == author);
+                                    if !is_self {
+                                        if let Some(voice) = voice_chat.lock().unwrap().as_ref() {
+                                            if let Err(error) = voice.push_remote_frame(author, *sample_rate, audio) {
+                                                eprintln!("ignored voice frame: {error}");
+                                            }
+                                        }
+                                    }
+                                }
+                                ServerMessage::LoggedOut
+                                | ServerMessage::SessionExpired { .. }
+                                | ServerMessage::AccountBanned { .. } => {
+                                    voice_chat.lock().unwrap().take();
+                                }
                                 _ => {}
                             }
                             apply_server_message(&window, &user_store, &stored_messages, message)
@@ -1079,6 +1317,7 @@ async fn connect_to_server(
             }
         }
     }
+    voice_chat.lock().unwrap().take();
     set_connection_lost(&window);
 }
 
@@ -1107,6 +1346,9 @@ fn set_connection_lost(window: &Weak<MainWindow>) {
                 None,
             ))));
             window.set_accent_name(ACCENT_OPTIONS[0].0.into());
+            window.set_theme_preset("Mocha".into());
+            window.set_voice_active(false);
+            window.set_voice_error("".into());
             window.set_profile_picture(slint::Image::default());
             window.set_profile_banner(slint::Image::default());
             if !account_banned {
@@ -1267,6 +1509,7 @@ fn apply_server_message(
                     editable_theme_colors(overrides),
                 )));
                 window.set_accent_name(preferred_accent(overrides).0.into());
+                window.set_theme_preset(selected_theme_preset(overrides).into());
                 window.set_profile_picture(profile_image(&profile.picture));
                 window.set_profile_banner(profile_image(&profile.banner));
                 window.set_username(username.into());
@@ -1290,6 +1533,7 @@ fn apply_server_message(
                     eprintln!("failed to clear expired saved session: {err}");
                 }
                 window.set_restoring_session(false);
+                window.set_voice_active(false);
                 window.set_auth_error(message.into());
             }
             ServerMessage::AccountBanned { message } => {
@@ -1303,6 +1547,7 @@ fn apply_server_message(
                 window.set_username("".into());
                 window.set_viewed_profile_open(false);
                 window.set_account_role(UserRole::Member.label().into());
+                window.set_voice_active(false);
                 window.set_auth_error(message.into());
             }
             ServerMessage::Error { message } => {
@@ -1338,6 +1583,9 @@ fn apply_server_message(
                 )));
                 window.set_account_role(UserRole::Member.label().into());
                 window.set_accent_name(ACCENT_OPTIONS[0].0.into());
+                window.set_theme_preset("Mocha".into());
+                window.set_voice_active(false);
+                window.set_voice_error("".into());
             }
             ServerMessage::Profile(profile) | ServerMessage::ProfileUpdated(profile) => {
                 let mut store = user_store.lock().unwrap();
@@ -1404,6 +1652,7 @@ fn apply_server_message(
                 };
                 append_stored_message(&window, &user_store, &stored_messages, stored);
             }
+            ServerMessage::VoiceFrame { .. } => {}
             ServerMessage::ChatServers {
                 servers,
                 active_server_id,
@@ -1490,10 +1739,10 @@ fn current_timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        PREFERRED_ACCENT_KEY, StoredMessage, UserStore, editable_theme_colors, parse_theme_color,
-        theme_colors,
+        PREFERRED_ACCENT_KEY, StoredMessage, THEME_PRESET_KEY, UserStore, apply_theme_preset,
+        editable_theme_colors, parse_theme_color, selected_theme_preset, theme_colors,
     };
-    use crate::protocol;
+    use oxide_rs::protocol;
     use std::collections::HashMap;
 
     #[test]
@@ -1536,6 +1785,22 @@ mod tests {
         assert_eq!(palette[23].hex.to_string(), "#123456");
         assert_eq!(palette[3].hex.to_string(), "#94e2d5");
         assert_eq!(palette[13].hex.to_string(), "#94e2d5");
+    }
+
+    #[test]
+    fn applies_and_persists_named_theme_presets() {
+        let mut overrides = HashMap::new();
+        assert_eq!(selected_theme_preset(None), "Mocha");
+        assert!(apply_theme_preset(&mut overrides, "Latte"));
+        assert_eq!(selected_theme_preset(Some(&overrides)), "Latte");
+        assert_eq!(
+            theme_colors(Some(&overrides))[23].hex.to_string(),
+            "#eff1f5"
+        );
+        assert!(!apply_theme_preset(&mut overrides, "Unknown"));
+
+        overrides.insert(THEME_PRESET_KEY.to_string(), "Custom".to_string());
+        assert_eq!(selected_theme_preset(Some(&overrides)), "Custom");
     }
 
     #[test]
