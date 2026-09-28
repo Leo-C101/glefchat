@@ -1,34 +1,46 @@
-import { HorizontalBox, VerticalBox, LineEdit, Button, ScrollView } from "std-widgets.slint";
-import { CatppuccinMocha } from "theme.slint";
-
+import { HorizontalBox, VerticalBox, LineEdit, Button, ScrollView, ComboBox } from "std-widgets.slint";
 export struct Message {
     content: string,
     timestamp: string,
     author: string,
 }
 
+export struct ThemeColor {
+    name: string,
+    key: string,
+    hex: string,
+    value: color,
+}
+
 export component MainWindow inherits Window {
     title: "GlefChat";
     width: 1280px;
     height: 780px;
-    background: CatppuccinMocha.base;
+    background: root.theme-colors[23].value;
     
     in-out property <[Message]> messages;
     in-out property <string> username: "";
     in-out property <bool> logged-in: false;
     in-out property <string> auth-error: "";
+    in-out property <[ThemeColor]> theme-colors;
+    in-out property <[ThemeColor]> editable-theme-colors;
+    in-out property <string> accent-name: "Lavender";
+    in-out property <bool> theme-editor-open: false;
+    in-out property <string> theme-error: "";
     callback send-message(string);
     callback login(string, string);
     callback register(string, string);
     callback log-out();
+    callback set-theme-color(int, string);
+    callback set-theme-accent(string);
     
     if !root.logged-in : Rectangle {
-        background: CatppuccinMocha.base;
+        background: root.theme-colors[23].value;
         
         Rectangle {
             width: 380px;
             height: 320px;
-            background: CatppuccinMocha.surface0;
+            background: root.theme-colors[22].value;
             border-radius: 14px;
             
             VerticalBox {
@@ -40,14 +52,14 @@ export component MainWindow inherits Window {
                     text: "GlefChat";
                     font-size: 26px;
                     font-weight: 700;
-                    color: CatppuccinMocha.lavender;
+                    color: root.theme-colors[13].value;
                     horizontal-alignment: center;
                 }
                 
                 Text {
                     text: "Sign in or create a profile";
                     font-size: 13px;
-                    color: CatppuccinMocha.subtext0;
+                    color: root.theme-colors[16].value;
                     horizontal-alignment: center;
                 }
                 
@@ -66,7 +78,7 @@ export component MainWindow inherits Window {
                 if root.auth-error != "" : Text {
                     text: root.auth-error;
                     font-size: 12px;
-                    color: CatppuccinMocha.red;
+                    color: root.theme-colors[4].value;
                     horizontal-alignment: center;
                     wrap: word-wrap;
                 }
@@ -96,7 +108,7 @@ export component MainWindow inherits Window {
         spacing: 16px;
         
         Rectangle {
-            background: CatppuccinMocha.surface0;
+            background: root.theme-colors[22].value;
             height: 60px;
             border-radius: 10px;
             
@@ -108,7 +120,7 @@ export component MainWindow inherits Window {
                     text: "GlefChat";
                     font-size: 22px;
                     font-weight: 700;
-                    color: CatppuccinMocha.lavender;
+                    color: root.theme-colors[13].value;
                     vertical-alignment: center;
                 }
                 
@@ -117,10 +129,18 @@ export component MainWindow inherits Window {
                 Text {
                     text: "Signed in as " + root.username;
                     font-size: 14px;
-                    color: CatppuccinMocha.subtext0;
+                    color: root.theme-colors[16].value;
                     vertical-alignment: center;
                 }
                 
+                Button {
+                    text: root.theme-editor-open ? "Chat" : "Theme";
+                    clicked => {
+                        root.theme-editor-open = !root.theme-editor-open;
+                        root.theme-error = "";
+                    }
+                }
+
                 Button {
                     text: "Log Out";
                     clicked => {
@@ -130,8 +150,98 @@ export component MainWindow inherits Window {
             }
         }
         
-        Rectangle {
-            background: CatppuccinMocha.surface0;
+        if root.theme-editor-open : Rectangle {
+            background: root.theme-colors[22].value;
+            border-radius: 10px;
+
+            VerticalBox {
+                padding: 14px;
+                spacing: 10px;
+
+                Text {
+                    text: "Customize theme";
+                    font-size: 18px;
+                    font-weight: 700;
+                    color: root.theme-colors[13].value;
+                }
+
+                Text {
+                    text: "Choose your accent and adjust backgrounds and text.";
+                    font-size: 13px;
+                    color: root.theme-colors[16].value;
+                }
+
+                HorizontalBox {
+                    height: 42px;
+                    spacing: 10px;
+
+                    Text {
+                        text: "Preferred accent";
+                        width: 140px;
+                        color: root.theme-colors[14].value;
+                        vertical-alignment: center;
+                    }
+
+                    Rectangle {
+                        width: 28px;
+                        height: 28px;
+                        background: root.theme-colors[13].value;
+                        border-radius: 4px;
+                    }
+
+                    ComboBox {
+                        model: ["Lavender", "Blue", "Sapphire", "Teal", "Green", "Yellow", "Peach", "Pink"];
+                        current-value: root.accent-name;
+                        selected(value) => {
+                            root.set-theme-accent(value);
+                        }
+                    }
+                }
+
+                if root.theme-error != "" : Text {
+                    text: root.theme-error;
+                    font-size: 12px;
+                    color: root.theme-colors[4].value;
+                }
+
+                ScrollView {
+                    VerticalBox {
+                        padding: 8px;
+                        spacing: 6px;
+
+                        for theme-color[index] in root.editable-theme-colors : HorizontalBox {
+                            height: 42px;
+                            spacing: 10px;
+
+                            Rectangle {
+                                width: 28px;
+                                height: 28px;
+                                background: theme-color.value;
+                                border-radius: 4px;
+                            }
+
+                            Text {
+                                text: theme-color.name;
+                                width: 120px;
+                                color: root.theme-colors[14].value;
+                                vertical-alignment: center;
+                            }
+
+                            color-input := LineEdit {
+                                text: theme-color.hex;
+                                placeholder-text: "#RRGGBB or #RRGGBBAA";
+                                accepted(text) => {
+                                    root.set-theme-color(index, text);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !root.theme-editor-open : Rectangle {
+            background: root.theme-colors[22].value;
             border-radius: 10px;
 
             VerticalBox {
@@ -139,7 +249,7 @@ export component MainWindow inherits Window {
                 spacing: 10px;
 
                 Rectangle {
-                    background: CatppuccinMocha.mantle;
+                    background: root.theme-colors[24].value;
                     border-radius: 10px;
     
                     ScrollView {
@@ -151,7 +261,7 @@ export component MainWindow inherits Window {
                             if root.messages.length == 0 : Text {
                                 text: "No messages yet — say hello!";
                                 font-size: 14px;
-                                color: CatppuccinMocha.overlay0;
+                                color: root.theme-colors[19].value;
                                 horizontal-alignment: center;
                             }
                             
@@ -161,7 +271,7 @@ export component MainWindow inherits Window {
                                 
                                 Rectangle {
                                     max-width: 700px;
-                                    background: message.author == root.username ? CatppuccinMocha.mauve : CatppuccinMocha.surface1;
+                                    background: message.author == root.username ? root.theme-colors[3].value : root.theme-colors[21].value;
                                     border-radius: 14px;
                                     
                                     VerticalBox {
@@ -172,21 +282,21 @@ export component MainWindow inherits Window {
                                             text: message.author;
                                             font-size: 12px;
                                             font-weight: 700;
-                                            color: message.author == root.username ? CatppuccinMocha.crust : CatppuccinMocha.lavender;
+                                            color: message.author == root.username ? root.theme-colors[25].value : root.theme-colors[13].value;
                                         }
                                         
                                         Text {
                                             text: message.content;
                                             font-size: 16px;
                                             wrap: word-wrap;
-                                            color: message.author == root.username ? CatppuccinMocha.crust : CatppuccinMocha.text;
+                                            color: message.author == root.username ? root.theme-colors[25].value : root.theme-colors[14].value;
                                         }
                                         
                                         Text {
                                             text: message.timestamp;
                                             font-size: 11px;
                                             horizontal-alignment: right;
-                                            color: message.author == root.username ? CatppuccinMocha.crust : CatppuccinMocha.subtext0;
+                                            color: message.author == root.username ? root.theme-colors[25].value : root.theme-colors[16].value;
                                         }
                                     }
                                 }
@@ -196,7 +306,7 @@ export component MainWindow inherits Window {
                 }
                 
                 Rectangle {
-                    background: CatppuccinMocha.surface1;
+                    background: root.theme-colors[21].value;
                     height: 52px;
                     border-radius: 10px;
 
