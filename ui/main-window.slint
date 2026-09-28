@@ -1,4 +1,4 @@
-import { HorizontalBox, VerticalBox, LineEdit, Button } from "std-widgets.slint";
+import { HorizontalBox, VerticalBox, LineEdit, Button, ScrollView } from "std-widgets.slint";
 import { CatppuccinMocha } from "theme.slint";
 
 export struct Message {
@@ -8,8 +8,9 @@ export struct Message {
 }
 
 export component MainWindow inherits Window {
+    title: "GlefChat";
     width: 1280px;
-    height: 720px;
+    height: 780px;
     background: CatppuccinMocha.base;
     
     in-out property <[Message]> messages;
@@ -18,62 +19,118 @@ export component MainWindow inherits Window {
     
     VerticalBox {
         padding: 20px;
-        spacing: 20px;
+        spacing: 16px;
         
-        HorizontalBox {
-            Text {
-                text: "Nickname:";
-                vertical-alignment: center;
-            }
+        Rectangle {
+            background: CatppuccinMocha.surface0;
+            height: 60px;
+            border-radius: 10px;
             
-            LineEdit {
-                text <=> root.nickname;
-                placeholder-text: "Enter nickname";
+            HorizontalBox {
+                padding-left: 14px;
+                padding-right: 14px;
+                
+                Text {
+                    text: "GlefChat";
+                    font-size: 22px;
+                    font-weight: 700;
+                    color: CatppuccinMocha.lavender;
+                    vertical-alignment: center;
+                }
+                
+                Rectangle { }
+                
+                Text {
+                    text: "Nickname:";
+                    font-size: 14px;
+                    color: CatppuccinMocha.subtext0;
+                    vertical-alignment: center;
+                }
+                
+                LineEdit {
+                    width: 180px;
+                    text <=> root.nickname;
+                    placeholder-text: "Enter nickname";
+                }
             }
         }
         
         Rectangle {
-            height: 100%;
             background: CatppuccinMocha.surface0;
-            
+            border-radius: 10px;
+
             VerticalBox {
-                for message[index] in root.messages : Rectangle {
-                    height: 10%;
-        
-                    Rectangle {
-                        background: CatppuccinMocha.surface1;
-                        
+                padding: 14px;
+                spacing: 10px;
+
+                Rectangle {
+                    background: CatppuccinMocha.mantle;
+                    border-radius: 10px;
+    
+                    ScrollView {
                         VerticalBox {
-                            spacing: 2px;
-                            Text {
-                                text: message.author;
-                                font-size: 16px;
-                            }
+                            padding: 12px;
+                            spacing: 10px;
+                            alignment: end;
                             
-                            Text {
-                                text: message.content;
-                                font-size: 20px;
-                            }
-                            
-                            Text {
-                                text: message.timestamp;
+                            if root.messages.length == 0 : Text {
+                                text: "No messages yet — say hello!";
                                 font-size: 14px;
-                                color: gray;
+                                color: CatppuccinMocha.overlay0;
+                                horizontal-alignment: center;
+                            }
+                            
+                            for message[index] in root.messages : HorizontalBox {
+                                padding: 0px;
+                                alignment: message.author == root.nickname ? end : start;
+                                
+                                Rectangle {
+                                    max-width: 700px;
+                                    background: message.author == root.nickname ? CatppuccinMocha.mauve : CatppuccinMocha.surface1;
+                                    border-radius: 14px;
+                                    
+                                    VerticalBox {
+                                        padding: 10px;
+                                        spacing: 3px;
+                                        
+                                        Text {
+                                            text: message.author;
+                                            font-size: 12px;
+                                            font-weight: 700;
+                                            color: message.author == root.nickname ? CatppuccinMocha.crust : CatppuccinMocha.lavender;
+                                        }
+                                        
+                                        Text {
+                                            text: message.content;
+                                            font-size: 16px;
+                                            wrap: word-wrap;
+                                            color: message.author == root.nickname ? CatppuccinMocha.crust : CatppuccinMocha.text;
+                                        }
+                                        
+                                        Text {
+                                            text: message.timestamp;
+                                            font-size: 11px;
+                                            horizontal-alignment: right;
+                                            color: message.author == root.nickname ? CatppuccinMocha.crust : CatppuccinMocha.subtext0;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 }
-            }
-            VerticalBox {
-                alignment: end;
                 
                 Rectangle {
                     background: CatppuccinMocha.surface1;
-                    height: 10%;
+                    height: 52px;
+                    border-radius: 10px;
 
                     HorizontalBox {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        
                         input := LineEdit {
-                            placeholder-text: "Enter Message";
+                            placeholder-text: "Type a message…";
                             accepted(text) => {
                                 root.send-message(text);
                                 self.text = "";
@@ -82,6 +139,7 @@ export component MainWindow inherits Window {
 
                         Button {
                             text: "Send";
+                            enabled: input.text != "";
                             clicked => {
                                 root.send-message(input.text);
                                 input.text = "";

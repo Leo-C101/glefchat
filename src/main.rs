@@ -52,7 +52,6 @@ fn main() -> Result<(), slint::PlatformError> {
     main_window.run()
 }
 
-// Connects to the chat server once, then forwards outgoing lines and appends incoming ones.
 async fn connect_to_server(
     addr: String,
     window: Weak<MainWindow>,
