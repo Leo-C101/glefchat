@@ -6,9 +6,30 @@ I made this using generative AI. It should not be used as a measure of my skills
 
 ## Running
 
-Start the authenticated server with `cargo run --bin server`, then start the client with `cargo run --bin glefchat`. The server listens only on `127.0.0.1:8080` by default. It creates a local TLS certificate and private key, plus its Argon2 password-hash database, under the platform config directory in `glefchat/`. The key and account database are restricted to the current OS user on Unix. Account passwords must be at least 12 bytes.
+Start the authenticated server with `cargo run --bin server`, then start the client with `cargo run --bin glefchat`. The server listens only on `127.0.0.1:8080` by default. It creates a local TLS certificate and private key, plus its Argon2 password-hash database, under the platform config directory in `glefchat/`. The key and account database are restricted to the current OS user on Unix. Account passwords must be at least 8 bytes.
 
-For another client on the same machine, the client trusts the generated certificate at `~/.config/glefchat/server-cert.pem` on Linux. On other platforms, use the corresponding platform config directory. The first run requires starting the server once so it can generate the certificate.
+### Windows 11
+
+Install the stable Rust MSVC toolchain and the Visual Studio C++ Build Tools workload. In two PowerShell terminals, start the server and client:
+
+```powershell
+cargo run --bin server
+```
+
+```powershell
+cargo run --bin glefchat
+```
+
+The server's generated files are stored under `$env:APPDATA\glefchat`; the client automatically trusts `$env:APPDATA\glefchat\server-cert.pem` when connecting to the local server. To bootstrap administrators, set the variable in the server's PowerShell terminal before starting it:
+
+```powershell
+$env:CHAT_ADMIN_USERNAMES = "alice,bob"
+cargo run --bin server
+```
+
+PowerShell environment variables apply to processes started from that terminal. For a remote server, set `CHAT_ADDR` and `CHAT_TLS_CERT` in the client terminal as described below, using the path where you saved the server's trust certificate.
+
+For another client on the same machine, the client trusts the generated certificate at `~/.config/glefchat/server-cert.pem` on Linux or `%APPDATA%\glefchat\server-cert.pem` on Windows. On other platforms, use the corresponding platform config directory. The first run requires starting the server once so it can generate the certificate.
 
 For a network deployment, configure the server with `CHAT_BIND_ADDR` (for example, `0.0.0.0:8080`) and provide a certificate and key whose names match the server address using `CHAT_TLS_CERT` and `CHAT_TLS_KEY`. Configure clients with `CHAT_ADDR=host:8080`, `CHAT_TLS_CERT` pointing to that certificate or its issuing CA, and optionally `CHAT_TLS_SERVER_NAME` when the certificate name differs from the address. Distribute the trust certificate through a trusted channel; do not expose the loopback self-signed certificate as a public server certificate.
 
