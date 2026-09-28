@@ -1,0 +1,95 @@
+import { HorizontalBox, VerticalBox, LineEdit, Button } from "std-widgets.slint";
+import { CatppuccinMocha } from "theme.slint";
+
+export struct Message {
+    content: string,
+    timestamp: string,
+    author: string,
+}
+
+export component MainWindow inherits Window {
+    width: 1280px;
+    height: 720px;
+    background: CatppuccinMocha.base;
+    
+    in-out property <[Message]> messages;
+    in-out property <string> nickname: "Me";
+    callback send-message(string);
+    
+    VerticalBox {
+        padding: 20px;
+        spacing: 20px;
+        
+        HorizontalBox {
+            Text {
+                text: "Nickname:";
+                vertical-alignment: center;
+            }
+            
+            LineEdit {
+                text <=> root.nickname;
+                placeholder-text: "Enter nickname";
+            }
+        }
+        
+        Rectangle {
+            height: 100%;
+            background: CatppuccinMocha.surface0;
+            
+            VerticalBox {
+                for message[index] in root.messages : Rectangle {
+                    height: 10%;
+        
+                    Rectangle {
+                        background: CatppuccinMocha.surface1;
+                        
+                        VerticalBox {
+                            spacing: 2px;
+                            Text {
+                                text: message.author;
+                                font-size: 16px;
+                            }
+                            
+                            Text {
+                                text: message.content;
+                                font-size: 20px;
+                            }
+                            
+                            Text {
+                                text: message.timestamp;
+                                font-size: 14px;
+                                color: gray;
+                            }
+                        }
+                    }
+                }
+            }
+            VerticalBox {
+                alignment: end;
+                
+                Rectangle {
+                    background: CatppuccinMocha.surface1;
+                    height: 10%;
+
+                    HorizontalBox {
+                        input := LineEdit {
+                            placeholder-text: "Enter Message";
+                            accepted(text) => {
+                                root.send-message(text);
+                                self.text = "";
+                            }
+                        }
+
+                        Button {
+                            text: "Send";
+                            clicked => {
+                                root.send-message(input.text);
+                                input.text = "";
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
