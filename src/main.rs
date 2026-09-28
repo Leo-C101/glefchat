@@ -1,9 +1,11 @@
+use base64::Engine;
 use protocol::{ClientMessage, ServerMessage};
+use protocol::{MAX_PROFILE_IMAGE_SIZE, UserProfile};
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
 use serde::{Deserialize, Serialize};
 use slint::{Color, Model, ModelRc, VecModel, Weak};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufReader as StdBufReader};
 use std::net::IpAddr;
@@ -32,6 +34,8 @@ fn chat_address() -> String {
 struct UserStore {
     #[serde(default)]
     themes: HashMap<String, HashMap<String, String>>,
+    #[serde(default)]
+    profiles: HashMap<String, UserProfile>,
 }
 
 const MAX_STORED_MESSAGES: usize = 500;
@@ -49,8 +53,21 @@ impl From<&StoredMessage> for Message {
             author: stored.author.clone().into(),
             content: stored.content.clone().into(),
             timestamp: stored.timestamp.clone().into(),
+            profile_picture: slint::Image::default(),
         }
     }
+}
+
+fn profile_image(encoded: &Option<String>) -> slint::Image {
+    encoded
+        .as_ref()
+        .and_then(|encoded| {
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .ok()
+        })
+        .and_then(|bytes| slint::Image::load_from_data(&bytes, None).ok())
+        .unwrap_or_default()
 }
 
 const DEFAULT_THEME: [(&str, &str); 26] = [
@@ -289,12 +306,20 @@ fn valid_username(username: &str) -> bool {
 fn main() -> Result<(), slint::PlatformError> {
     let main_window = MainWindow::new()?;
 
+    let user_store = Arc::new(Mutex::new(load_user_store()));
     let stored_messages = Arc::new(Mutex::new(load_messages()));
+    let profiles = user_store.lock().unwrap().profiles.clone();
     let messages: Vec<Message> = stored_messages
         .lock()
         .unwrap()
         .iter()
-        .map(Message::from)
+        .map(|stored| {
+            let mut message = Message::from(stored);
+            if let Some(profile) = profiles.get(&stored.author) {
+                message.profile_picture = profile_image(&profile.picture);
+            }
+            message
+        })
         .collect();
 
     let model_rc: ModelRc<Message> = ModelRc::new(VecModel::from(messages));
@@ -310,7 +335,6 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel::<ClientMessage>();
 
-    let user_store = Arc::new(Mutex::new(load_user_store()));
     if let Err(err) = save_user_store(&user_store.lock().unwrap()) {
         eprintln!("failed to migrate local preferences: {err}");
     }
@@ -319,8 +343,10 @@ fn main() -> Result<(), slint::PlatformError> {
         main_window.as_weak(),
         user_store.clone(),
         stored_messages.clone(),
+        outgoing_tx.clone(),
         outgoing_rx,
     ));
+    let runtime_handle = runtime.handle().clone();
 
     {
         let window = main_window.as_weak();
@@ -449,6 +475,38 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let window = main_window.as_weak();
         let user_store = user_store.clone();
+        let outgoing_tx = outgoing_tx.clone();
+        let runtime_handle = runtime_handle.clone();
+        main_window.on_choose_profile_picture(move || {
+            launch_profile_image_picker(
+                window.clone(),
+                runtime_handle.clone(),
+                user_store.clone(),
+                outgoing_tx.clone(),
+                false,
+            );
+        });
+    }
+
+    {
+        let window = main_window.as_weak();
+        let user_store = user_store.clone();
+        let outgoing_tx = outgoing_tx.clone();
+        let runtime_handle = runtime_handle.clone();
+        main_window.on_choose_profile_banner(move || {
+            launch_profile_image_picker(
+                window.clone(),
+                runtime_handle.clone(),
+                user_store.clone(),
+                outgoing_tx.clone(),
+                true,
+            );
+        });
+    }
+
+    {
+        let window = main_window.as_weak();
+        let user_store = user_store.clone();
         main_window.on_set_theme_accent(move |accent| {
             let Some(win) = window.upgrade() else { return };
             let Some((accent_name, _)) = ACCENT_OPTIONS
@@ -490,11 +548,116 @@ fn main() -> Result<(), slint::PlatformError> {
     main_window.run()
 }
 
+fn launch_profile_image_picker(
+    window: Weak<MainWindow>,
+    runtime: tokio::runtime::Handle,
+    user_store: Arc<Mutex<UserStore>>,
+    outgoing_tx: mpsc::UnboundedSender<ClientMessage>,
+    is_banner: bool,
+) {
+    runtime.spawn(async move {
+        let selected = tokio::task::spawn_blocking(|| {
+            rfd::FileDialog::new()
+                .add_filter("Image files", &["png", "jpg", "jpeg", "webp"])
+                .pick_file()
+        })
+        .await;
+        let path = match selected {
+            Ok(Some(path)) => path,
+            Ok(None) => return,
+            Err(err) => {
+                set_profile_error(&window, format!("Could not open image picker: {err}"));
+                return;
+            }
+        };
+
+        let bytes = match async {
+            let metadata = tokio::fs::metadata(&path)
+                .await
+                .map_err(|err| err.to_string())?;
+            if metadata.len() > MAX_PROFILE_IMAGE_SIZE as u64 {
+                return Err("Choose an image no larger than 512 KiB.".to_string());
+            }
+            let bytes = tokio::fs::read(&path)
+                .await
+                .map_err(|err| err.to_string())?;
+            if bytes.is_empty() || bytes.len() > MAX_PROFILE_IMAGE_SIZE {
+                return Err("Choose an image no larger than 512 KiB.".to_string());
+            }
+            slint::Image::load_from_data(&bytes, None)
+                .map_err(|_| "Choose a valid PNG, JPEG, or WebP image.".to_string())?;
+            Ok::<_, String>(bytes)
+        }
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(message) => {
+                set_profile_error(&window, message);
+                return;
+            }
+        };
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(window) = window.upgrade() else {
+                return;
+            };
+            let username = window.get_username().to_string();
+            if username.is_empty() {
+                window.set_profile_error("Sign in before editing your profile.".into());
+                return;
+            }
+            let mut store = user_store.lock().unwrap();
+            let profile = store
+                .profiles
+                .entry(username.clone())
+                .or_insert_with(|| UserProfile {
+                    username,
+                    picture: None,
+                    banner: None,
+                });
+            if is_banner {
+                profile.banner = Some(encoded.clone());
+            } else {
+                profile.picture = Some(encoded.clone());
+            }
+            let picture = profile.picture.clone();
+            let banner = profile.banner.clone();
+            drop(store);
+
+            if outgoing_tx
+                .send(ClientMessage::UpdateProfile { picture, banner })
+                .is_err()
+            {
+                window.set_profile_error("Could not send the profile update.".into());
+                return;
+            }
+            let image = profile_image(&Some(encoded));
+            if is_banner {
+                window.set_profile_banner(image);
+            } else {
+                window.set_profile_picture(image);
+            }
+            window.set_profile_error("".into());
+        });
+    });
+}
+
+fn set_profile_error(window: &Weak<MainWindow>, message: String) {
+    let window = window.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = window.upgrade() {
+            window.set_profile_error(message.into());
+        }
+    });
+}
+
 async fn connect_to_server(
     addr: String,
     window: Weak<MainWindow>,
     user_store: Arc<Mutex<UserStore>>,
     stored_messages: Arc<Mutex<Vec<StoredMessage>>>,
+    outgoing_tx: mpsc::UnboundedSender<ClientMessage>,
     mut outgoing_rx: mpsc::UnboundedReceiver<ClientMessage>,
 ) {
     let stream = match TcpStream::connect(&addr).await {
@@ -533,6 +696,7 @@ async fn connect_to_server(
 
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut lines = BufReader::new(read_half).lines();
+    let mut requested_profiles = HashSet::new();
     loop {
         tokio::select! {
             command = outgoing_rx.recv() => {
@@ -554,6 +718,42 @@ async fn connect_to_server(
                 match result {
                     Ok(Some(line)) => match serde_json::from_str::<ServerMessage>(&line) {
                         Ok(message) => {
+                            match &message {
+                                ServerMessage::Authenticated { username, .. } => {
+                                    requested_profiles.insert(username.clone());
+                                    let mut authors: HashSet<_> = user_store
+                                        .lock()
+                                        .unwrap()
+                                        .profiles
+                                        .keys()
+                                        .cloned()
+                                        .collect();
+                                    authors.extend(stored_messages
+                                        .lock()
+                                        .unwrap()
+                                        .iter()
+                                        .map(|stored| stored.author.clone())
+                                    );
+                                    for author in authors {
+                                        if author != *username
+                                            && requested_profiles.insert(author.clone())
+                                        {
+                                            let _ = outgoing_tx.send(ClientMessage::GetProfile { username: author });
+                                        }
+                                    }
+                                }
+                                ServerMessage::ChatMessage { author, .. } => {
+                                    let cached = user_store.lock().unwrap();
+                                    if !cached.profiles.contains_key(author)
+                                        && requested_profiles.insert(author.clone())
+                                    {
+                                        let _ = outgoing_tx.send(ClientMessage::GetProfile {
+                                            username: author.clone(),
+                                        });
+                                    }
+                                }
+                                _ => {}
+                            }
                             apply_server_message(&window, &user_store, &stored_messages, message)
                         }
                         Err(err) => eprintln!("ignored invalid server response: {err}"),
@@ -590,9 +790,28 @@ fn set_connection_lost(window: &Weak<MainWindow>) {
                 None,
             ))));
             window.set_accent_name(ACCENT_OPTIONS[0].0.into());
+            window.set_profile_picture(slint::Image::default());
+            window.set_profile_banner(slint::Image::default());
             window.set_auth_error("Connection to the chat server was lost.".into());
         }
     });
+}
+
+fn refresh_message_avatars(window: &MainWindow, profiles: &HashMap<String, UserProfile>) {
+    let model = window.get_messages();
+    let Some(messages) = model.as_any().downcast_ref::<VecModel<Message>>() else {
+        return;
+    };
+    for index in 0..messages.row_count() {
+        let Some(mut message) = messages.row_data(index) else {
+            continue;
+        };
+        message.profile_picture = profiles
+            .get(message.author.as_str())
+            .map(|profile| profile_image(&profile.picture))
+            .unwrap_or_default();
+        messages.set_row_data(index, message);
+    }
 }
 
 fn apply_server_message(
@@ -609,17 +828,34 @@ fn apply_server_message(
             return;
         };
         match message {
-            ServerMessage::Authenticated { username } => {
-                let store = user_store.lock().unwrap();
+            ServerMessage::Authenticated {
+                username,
+                picture,
+                banner,
+            } => {
+                let profile = UserProfile {
+                    username: username.clone(),
+                    picture,
+                    banner,
+                };
+                let mut store = user_store.lock().unwrap();
+                store.profiles.insert(username.clone(), profile.clone());
                 let overrides = store.themes.get(&username);
                 window.set_theme_colors(ModelRc::new(VecModel::from(theme_colors(overrides))));
                 window.set_editable_theme_colors(ModelRc::new(VecModel::from(
                     editable_theme_colors(overrides),
                 )));
                 window.set_accent_name(preferred_accent(overrides).0.into());
+                window.set_profile_picture(profile_image(&profile.picture));
+                window.set_profile_banner(profile_image(&profile.banner));
                 window.set_username(username.into());
                 window.set_auth_error("".into());
+                window.set_profile_error("".into());
                 window.set_logged_in(true);
+                refresh_message_avatars(&window, &store.profiles);
+                if let Err(err) = save_user_store(&store) {
+                    eprintln!("failed to cache user profile: {err}");
+                }
             }
             ServerMessage::AuthenticationFailed { message } | ServerMessage::Error { message } => {
                 window.set_auth_error(message.into());
@@ -627,11 +863,27 @@ fn apply_server_message(
             ServerMessage::LoggedOut => {
                 window.set_logged_in(false);
                 window.set_username("".into());
+                window.set_profile_picture(slint::Image::default());
+                window.set_profile_banner(slint::Image::default());
                 window.set_theme_colors(ModelRc::new(VecModel::from(theme_colors(None))));
                 window.set_editable_theme_colors(ModelRc::new(VecModel::from(
                     editable_theme_colors(None),
                 )));
                 window.set_accent_name(ACCENT_OPTIONS[0].0.into());
+            }
+            ServerMessage::Profile(profile) | ServerMessage::ProfileUpdated(profile) => {
+                let mut store = user_store.lock().unwrap();
+                store
+                    .profiles
+                    .insert(profile.username.clone(), profile.clone());
+                refresh_message_avatars(&window, &store.profiles);
+                if profile.username == window.get_username().as_str() {
+                    window.set_profile_picture(profile_image(&profile.picture));
+                    window.set_profile_banner(profile_image(&profile.banner));
+                }
+                if let Err(err) = save_user_store(&store) {
+                    eprintln!("failed to cache user profile: {err}");
+                }
             }
             ServerMessage::ChatMessage { author, content } => {
                 let stored = StoredMessage {
@@ -641,7 +893,11 @@ fn apply_server_message(
                 };
                 let model = window.get_messages();
                 if let Some(vec_model) = model.as_any().downcast_ref::<VecModel<Message>>() {
-                    vec_model.push(Message::from(&stored));
+                    let mut message = Message::from(&stored);
+                    if let Some(profile) = user_store.lock().unwrap().profiles.get(&author) {
+                        message.profile_picture = profile_image(&profile.picture);
+                    }
+                    vec_model.push(message);
                 }
 
                 let mut messages = stored_messages.lock().unwrap();

@@ -1,6 +1,7 @@
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash};
-use protocol::{ClientMessage, ServerMessage};
+use base64::Engine;
+use protocol::{ClientMessage, MAX_PROFILE_IMAGE_SIZE, ServerMessage, UserProfile};
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
@@ -21,12 +22,40 @@ mod protocol;
 const MIN_PASSWORD_LENGTH: usize = 8;
 const MAX_PASSWORD_LENGTH: usize = 1024;
 const MAX_MESSAGE_LENGTH: usize = 4096;
-const MAX_REQUEST_LENGTH: usize = 16 * 1024;
+const MAX_REQUEST_LENGTH: usize = 1_500_000;
 const MAX_CONNECTIONS: usize = 128;
 
 #[derive(Default, Serialize, Deserialize)]
 struct UserStore {
     users: HashMap<String, String>,
+    #[serde(default)]
+    profiles: HashMap<String, UserProfile>,
+}
+
+#[derive(Clone)]
+enum Broadcast {
+    ChatMessage { author: String, content: String },
+    ProfileUpdated(UserProfile),
+}
+
+fn valid_profile_image(image: &Option<String>) -> bool {
+    image.as_ref().is_none_or(|image| {
+        base64::engine::general_purpose::STANDARD
+            .decode(image)
+            .is_ok_and(|bytes| !bytes.is_empty() && bytes.len() <= MAX_PROFILE_IMAGE_SIZE)
+    })
+}
+
+fn user_profile(store: &UserStore, username: &str) -> UserProfile {
+    store
+        .profiles
+        .get(username)
+        .cloned()
+        .unwrap_or_else(|| UserProfile {
+            username: username.to_string(),
+            picture: None,
+            banner: None,
+        })
 }
 
 impl UserStore {
@@ -208,7 +237,7 @@ async fn main() -> io::Result<()> {
     let bind_addr =
         std::env::var("CHAT_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
     let listener = TcpListener::bind(&bind_addr).await?;
-    let (tx, _) = broadcast::channel::<(SocketAddr, String, String)>(100);
+    let (tx, _) = broadcast::channel::<Broadcast>(100);
     let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
     println!("GlefChat server listening on {bind_addr} with TLS");
@@ -243,8 +272,8 @@ async fn main() -> io::Result<()> {
 async fn handle_connection(
     stream: tokio_rustls::server::TlsStream<TcpStream>,
     addr: SocketAddr,
-    tx: broadcast::Sender<(SocketAddr, String, String)>,
-    mut rx: broadcast::Receiver<(SocketAddr, String, String)>,
+    tx: broadcast::Sender<Broadcast>,
+    mut rx: broadcast::Receiver<Broadcast>,
     users: Arc<Mutex<UserStore>>,
 ) -> io::Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
@@ -316,7 +345,12 @@ async fn handle_connection(
                                     return Err(err);
                                 }
                                 authenticated_user = Some(username.clone());
-                                send_response(&mut writer, ServerMessage::Authenticated { username }).await?;
+                                let profile = user_profile(&store, &username);
+                                send_response(&mut writer, ServerMessage::Authenticated {
+                                    username,
+                                    picture: profile.picture,
+                                    banner: profile.banner,
+                                }).await?;
                             }
                         }
                     }
@@ -343,7 +377,13 @@ async fn handle_connection(
                         .map_err(io::Error::other)?;
                         if valid {
                             authenticated_user = Some(username.clone());
-                            send_response(&mut writer, ServerMessage::Authenticated { username }).await?;
+                            let store = users.lock().await;
+                            let profile = user_profile(&store, &username);
+                            send_response(&mut writer, ServerMessage::Authenticated {
+                                username,
+                                picture: profile.picture,
+                                banner: profile.banner,
+                            }).await?;
                         } else {
                             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                             send_response(&mut writer, ServerMessage::AuthenticationFailed {
@@ -367,16 +407,65 @@ async fn handle_connection(
                                 message: "Messages must contain 1-4096 bytes.".to_string(),
                             }).await?;
                         } else {
-                            let _ = tx.send((addr, author.clone(), content));
+                            let _ = tx.send(Broadcast::ChatMessage {
+                                author: author.clone(),
+                                content,
+                            });
                         }
+                    }
+                    ClientMessage::GetProfile { username } => {
+                        if authenticated_user.is_none() {
+                            send_response(&mut writer, ServerMessage::AuthenticationFailed {
+                                message: "Sign in before viewing profiles.".to_string(),
+                            }).await?;
+                        } else {
+                            let store = users.lock().await;
+                            send_response(&mut writer, ServerMessage::Profile(user_profile(&store, &username))).await?;
+                        }
+                    }
+                    ClientMessage::UpdateProfile { picture, banner } => {
+                        let Some(username) = authenticated_user.as_ref() else {
+                            send_response(&mut writer, ServerMessage::AuthenticationFailed {
+                                message: "Sign in before updating your profile.".to_string(),
+                            }).await?;
+                            continue;
+                        };
+                        if !valid_profile_image(&picture) || !valid_profile_image(&banner) {
+                            send_response(&mut writer, ServerMessage::Error {
+                                message: "Profile images must be valid base64 and no larger than 512 KiB.".to_string(),
+                            }).await?;
+                            continue;
+                        }
+                        let profile = UserProfile {
+                            username: username.clone(),
+                            picture,
+                            banner,
+                        };
+                        let mut store = users.lock().await;
+                        let previous = store.profiles.insert(username.clone(), profile.clone());
+                        if let Err(err) = store.save() {
+                            if let Some(previous) = previous {
+                                store.profiles.insert(username.clone(), previous);
+                            } else {
+                                store.profiles.remove(username);
+                            }
+                            return Err(err);
+                        }
+                        drop(store);
+                        let _ = tx.send(Broadcast::ProfileUpdated(profile));
                     }
                 }
             }
             result = rx.recv() => {
                 match result {
-                    Ok((_sender_addr, author, content)) => {
+                    Ok(Broadcast::ChatMessage { author, content }) => {
                         if authenticated_user.is_some() {
                             send_response(&mut writer, ServerMessage::ChatMessage { author, content }).await?;
+                        }
+                    }
+                    Ok(Broadcast::ProfileUpdated(profile)) => {
+                        if authenticated_user.is_some() {
+                            send_response(&mut writer, ServerMessage::ProfileUpdated(profile)).await?;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -395,10 +484,12 @@ async fn handle_connection(
 #[cfg(test)]
 mod tests {
     use super::{
-        UserStore, handle_connection, hash_password, tls_acceptor_with_paths, valid_username,
-        verify_password,
+        UserStore, handle_connection, hash_password, tls_acceptor_with_paths, valid_profile_image,
+        valid_username, verify_password,
     };
+    use crate::protocol::MAX_PROFILE_IMAGE_SIZE;
     use crate::protocol::{ClientMessage, ServerMessage};
+    use base64::Engine;
     use rustls::pki_types::ServerName;
     use rustls::{ClientConfig, RootCertStore};
     use serde::Serialize;
@@ -435,6 +526,20 @@ mod tests {
         assert!(valid_username("alice_42"));
         assert!(!valid_username("al"));
         assert!(!valid_username("alice\t42"));
+    }
+
+    #[test]
+    fn profile_images_are_limited_by_decoded_size() {
+        let within_limit = vec![0; MAX_PROFILE_IMAGE_SIZE];
+        let too_large = vec![0; MAX_PROFILE_IMAGE_SIZE + 1];
+        assert!(valid_profile_image(&Some(
+            base64::engine::general_purpose::STANDARD.encode(within_limit)
+        )));
+        assert!(!valid_profile_image(&Some(
+            base64::engine::general_purpose::STANDARD.encode(too_large)
+        )));
+        assert!(!valid_profile_image(&Some("not base64".to_string())));
+        assert!(valid_profile_image(&None));
     }
 
     #[test]
@@ -476,6 +581,7 @@ mod tests {
                 "alice".to_string(),
                 hash_password("correct horse battery staple").unwrap(),
             )]),
+            profiles: HashMap::new(),
         }));
         let server_tx = tx.clone();
         let server_users = users.clone();
@@ -520,7 +626,40 @@ mod tests {
         .await?;
         assert!(matches!(
             read_message(&mut reader).await?,
-            ServerMessage::Authenticated { username } if username == "alice"
+            ServerMessage::Authenticated { username, .. } if username == "alice"
+        ));
+
+        let picture = base64::engine::general_purpose::STANDARD.encode(b"avatar");
+        let banner = base64::engine::general_purpose::STANDARD.encode(b"banner");
+        send_message(
+            &mut writer,
+            &ClientMessage::UpdateProfile {
+                picture: Some(picture.clone()),
+                banner: Some(banner.clone()),
+            },
+        )
+        .await?;
+        assert!(matches!(
+            read_message(&mut reader).await?,
+            ServerMessage::ProfileUpdated(profile)
+                if profile.username == "alice"
+                    && profile.picture.as_deref() == Some(picture.as_str())
+                    && profile.banner.as_deref() == Some(banner.as_str())
+        ));
+
+        send_message(
+            &mut writer,
+            &ClientMessage::GetProfile {
+                username: "alice".to_string(),
+            },
+        )
+        .await?;
+        assert!(matches!(
+            read_message(&mut reader).await?,
+            ServerMessage::Profile(profile)
+                if profile.username == "alice"
+                    && profile.picture.as_deref() == Some(picture.as_str())
+                    && profile.banner.as_deref() == Some(banner.as_str())
         ));
 
         send_message(
