@@ -3,6 +3,7 @@ export struct Message {
     content: string,
     timestamp: string,
     author: string,
+    is-system: bool,
     profile-picture: image,
 }
 
@@ -11,6 +12,14 @@ export struct ThemeColor {
     key: string,
     hex: string,
     value: color,
+}
+
+component ChatScrollView inherits ScrollView {
+    in property <int> scroll-request: 0;
+
+    changed scroll-request => {
+        root.content-y = root.content-height;
+    }
 }
 
 export component MainWindow inherits Window {
@@ -41,6 +50,8 @@ export component MainWindow inherits Window {
     in-out property <image> profile-banner;
     in-out property <image> viewed-profile-picture;
     in-out property <image> viewed-profile-banner;
+    in-out property <bool> follow-chat-bottom: true;
+    in-out property <int> chat-scroll-request: 0;
     callback send-message(string);
     callback login(string, string);
     callback register(string, string);
@@ -439,12 +450,6 @@ export component MainWindow inherits Window {
 
         if !root.theme-editor-open && !root.profile-editor-open : chat-panel := Rectangle {
             property <bool> follow-chat-bottom: true;
-            property <int> observed-message-count: root.messages.length;
-            changed observed-message-count => {
-                if (follow-chat-bottom) {
-                    chat-scroll.content-y = chat-scroll.content-height;
-                }
-            }
             background: root.theme-colors[22].value;
             border-radius: 10px;
 
@@ -456,9 +461,17 @@ export component MainWindow inherits Window {
                     background: root.theme-colors[24].value;
                     border-radius: 10px;
     
-                    chat-scroll := ScrollView {
+                    chat-scroll := ChatScrollView {
+                        scroll-request: root.chat-scroll-request;
+
+                        changed content-height => {
+                            if (chat-panel.follow-chat-bottom) {
+                                chat-scroll.content-y = chat-scroll.content-height;
+                            }
+                        }
+
                         changed content-y => {
-                            chat-panel.follow-chat-bottom = chat-scroll.content-height - chat-scroll.visible-height - chat-scroll.content-y <= 80px;
+                            root.follow-chat-bottom = chat-scroll.content-height - chat-scroll.visible-height - chat-scroll.content-y <= 80px;
                         }
 
                         VerticalBox {
@@ -475,9 +488,16 @@ export component MainWindow inherits Window {
                             
                             for message[index] in root.messages : HorizontalBox {
                                 padding: 0px;
-                                alignment: message.author == root.username ? end : start;
+                                alignment: message.is-system ? center : (message.author == root.username ? end : start);
 
-                                if message.author != root.username : Rectangle {
+                                if message.is-system : Text {
+                                    text: message.content;
+                                    font-size: 12px;
+                                    color: root.theme-colors[19].value;
+                                    horizontal-alignment: center;
+                                }
+
+                                if !message.is-system && message.author != root.username : Rectangle {
                                     width: 38px;
                                     height: 38px;
                                     background: root.theme-colors[21].value;
@@ -498,7 +518,7 @@ export component MainWindow inherits Window {
                                     }
                                 }
                                 
-                                Rectangle {
+                                if !message.is-system : Rectangle {
                                     max-width: 700px;
                                     background: message.author == root.username ? root.theme-colors[3].value : root.theme-colors[21].value;
                                     border-radius: 14px;
@@ -542,7 +562,7 @@ export component MainWindow inherits Window {
                                     }
                                 }
 
-                                if message.author == root.username : Rectangle {
+                                if !message.is-system && message.author == root.username : Rectangle {
                                     width: 38px;
                                     height: 38px;
                                     background: root.theme-colors[21].value;

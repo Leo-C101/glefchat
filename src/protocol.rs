@@ -112,6 +112,12 @@ pub enum ServerMessage {
         author: String,
         content: String,
     },
+    UserJoined {
+        username: String,
+    },
+    UserLeft {
+        username: String,
+    },
     ProfileUpdated(UserProfile),
     Profile(UserProfile),
     Error {

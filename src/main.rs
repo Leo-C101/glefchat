@@ -53,6 +53,8 @@ struct StoredMessage {
     author: String,
     content: String,
     timestamp: String,
+    #[serde(default)]
+    is_system: bool,
 }
 
 impl From<&StoredMessage> for Message {
@@ -61,6 +63,7 @@ impl From<&StoredMessage> for Message {
             author: stored.author.clone().into(),
             content: stored.content.clone().into(),
             timestamp: stored.timestamp.clone().into(),
+            is_system: stored.is_system,
             profile_picture: slint::Image::default(),
         }
     }
@@ -891,6 +894,65 @@ fn refresh_message_avatars(window: &MainWindow, profiles: &HashMap<String, UserP
     }
 }
 
+fn append_stored_message(
+    window: &MainWindow,
+    user_store: &Arc<Mutex<UserStore>>,
+    stored_messages: &Arc<Mutex<Vec<StoredMessage>>>,
+    stored: StoredMessage,
+) {
+    let follow_chat_bottom = window.get_follow_chat_bottom();
+    let model = window.get_messages();
+    if let Some(vec_model) = model.as_any().downcast_ref::<VecModel<Message>>() {
+        let mut message = Message::from(&stored);
+        if !stored.is_system
+            && let Some(profile) = user_store.lock().unwrap().profiles.get(&stored.author)
+        {
+            message.profile_picture = profile_image(&profile.picture);
+        }
+        vec_model.push(message);
+        if follow_chat_bottom {
+            let window = window.as_weak();
+            slint::Timer::single_shot(std::time::Duration::from_millis(20), move || {
+                if let Some(window) = window.upgrade() {
+                    window
+                        .set_chat_scroll_request(window.get_chat_scroll_request().wrapping_add(1));
+                }
+            });
+        }
+    }
+
+    let mut messages = stored_messages.lock().unwrap();
+    messages.push(stored);
+    let overflow = messages.len().saturating_sub(MAX_STORED_MESSAGES);
+    if overflow > 0 {
+        messages.drain(0..overflow);
+    }
+    if let Err(err) = save_messages(&messages) {
+        eprintln!("failed to save chat history: {err}");
+    }
+}
+
+fn append_presence_message(
+    window: &MainWindow,
+    user_store: &Arc<Mutex<UserStore>>,
+    stored_messages: &Arc<Mutex<Vec<StoredMessage>>>,
+    username: String,
+    joined: bool,
+) {
+    let verb = if joined { "joined" } else { "left" };
+    append_stored_message(
+        window,
+        user_store,
+        stored_messages,
+        StoredMessage {
+            author: String::new(),
+            content: format!("{username} {verb} the chat"),
+            timestamp: current_timestamp(),
+            is_system: true,
+        },
+    );
+}
+
 fn apply_server_message(
     window: &Weak<MainWindow>,
     user_store: &Arc<Mutex<UserStore>>,
@@ -991,30 +1053,20 @@ fn apply_server_message(
                     eprintln!("failed to cache user profile: {err}");
                 }
             }
+            ServerMessage::UserJoined { username } => {
+                append_presence_message(&window, &user_store, &stored_messages, username, true);
+            }
+            ServerMessage::UserLeft { username } => {
+                append_presence_message(&window, &user_store, &stored_messages, username, false);
+            }
             ServerMessage::ChatMessage { author, content } => {
                 let stored = StoredMessage {
                     author: author.clone(),
                     content: content.clone(),
                     timestamp: current_timestamp(),
+                    is_system: false,
                 };
-                let model = window.get_messages();
-                if let Some(vec_model) = model.as_any().downcast_ref::<VecModel<Message>>() {
-                    let mut message = Message::from(&stored);
-                    if let Some(profile) = user_store.lock().unwrap().profiles.get(&author) {
-                        message.profile_picture = profile_image(&profile.picture);
-                    }
-                    vec_model.push(message);
-                }
-
-                let mut messages = stored_messages.lock().unwrap();
-                messages.push(stored);
-                let overflow = messages.len().saturating_sub(MAX_STORED_MESSAGES);
-                if overflow > 0 {
-                    messages.drain(0..overflow);
-                }
-                if let Err(err) = save_messages(&messages) {
-                    eprintln!("failed to save chat history: {err}");
-                }
+                append_stored_message(&window, &user_store, &stored_messages, stored);
             }
         }
     });
@@ -1031,7 +1083,8 @@ fn current_timestamp() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        PREFERRED_ACCENT_KEY, UserStore, editable_theme_colors, parse_theme_color, theme_colors,
+        PREFERRED_ACCENT_KEY, StoredMessage, UserStore, editable_theme_colors, parse_theme_color,
+        theme_colors,
     };
     use std::collections::HashMap;
 
@@ -1052,6 +1105,14 @@ mod tests {
         let store: UserStore =
             serde_json::from_str(r#"{"users":{"alice":"hash"},"last_session":"alice"}"#).unwrap();
         assert!(store.themes.is_empty());
+    }
+
+    #[test]
+    fn legacy_chat_messages_default_to_non_system() {
+        let message: StoredMessage =
+            serde_json::from_str(r#"{"author":"alice","content":"hello","timestamp":"12:00"}"#)
+                .unwrap();
+        assert!(!message.is_system);
     }
 
     #[test]

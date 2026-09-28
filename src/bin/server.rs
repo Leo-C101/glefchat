@@ -38,12 +38,47 @@ struct UserStore {
     banned_users: HashSet<String>,
     #[serde(skip)]
     bootstrap_admins: HashSet<String>,
+    #[serde(skip)]
+    store_path: Option<PathBuf>,
 }
 
 #[derive(Clone)]
 enum Broadcast {
     ChatMessage { author: String, content: String },
     ProfileUpdated(UserProfile),
+    UserJoined { username: String },
+    UserLeft { username: String },
+}
+
+struct OnlinePresence {
+    sender: broadcast::Sender<Broadcast>,
+    username: Option<String>,
+}
+
+impl OnlinePresence {
+    fn new(sender: broadcast::Sender<Broadcast>) -> Self {
+        Self {
+            sender,
+            username: None,
+        }
+    }
+
+    fn joined(&mut self, username: String) {
+        self.username = Some(username.clone());
+        let _ = self.sender.send(Broadcast::UserJoined { username });
+    }
+
+    fn left(&mut self) {
+        if let Some(username) = self.username.take() {
+            let _ = self.sender.send(Broadcast::UserLeft { username });
+        }
+    }
+}
+
+impl Drop for OnlinePresence {
+    fn drop(&mut self) {
+        self.left();
+    }
 }
 
 fn valid_profile_image(image: &Option<String>) -> bool {
@@ -112,12 +147,17 @@ fn role_change_error(
 impl UserStore {
     fn load() -> io::Result<Self> {
         let path = users_file_path()?;
+        Self::load_from(&path, configured_admin_usernames())
+    }
+
+    fn load_from(path: &Path, bootstrap_admins: HashSet<String>) -> io::Result<Self> {
         let mut store = match fs::read_to_string(path) {
             Ok(contents) => serde_json::from_str(&contents).map_err(io::Error::other)?,
             Err(err) if err.kind() == io::ErrorKind::NotFound => Self::default(),
             Err(err) => return Err(err),
         };
-        store.bootstrap_admins = configured_admin_usernames();
+        store.bootstrap_admins = bootstrap_admins;
+        store.store_path = Some(path.to_owned());
         let mut changed = false;
         for username in store.bootstrap_admins.clone() {
             if store.users.contains_key(&username)
@@ -133,10 +173,17 @@ impl UserStore {
     }
 
     fn save(&self) -> io::Result<()> {
-        let path = users_file_path()?;
+        let path = match &self.store_path {
+            Some(path) => path.clone(),
+            None => users_file_path()?,
+        };
+        self.save_to(&path)
+    }
+
+    fn save_to(&self, path: &Path) -> io::Result<()> {
         ensure_private_directory(path.parent().expect("users path has a parent"))?;
         write_private_file(
-            &path,
+            path,
             &serde_json::to_vec_pretty(self).map_err(io::Error::other)?,
         )
     }
@@ -343,6 +390,7 @@ async fn handle_connection(
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = AsyncBufReader::new(reader);
     let mut authenticated_user: Option<String> = None;
+    let mut presence = OnlinePresence::new(tx.clone());
 
     loop {
         tokio::select! {
@@ -416,6 +464,7 @@ async fn handle_connection(
                                     return Err(err);
                                 }
                                 authenticated_user = Some(username.clone());
+                                presence.joined(username.clone());
                                 let profile = user_profile(&store, &username);
                                 send_response(&mut writer, ServerMessage::Authenticated {
                                     username,
@@ -456,6 +505,7 @@ async fn handle_connection(
                                 continue;
                             }
                             authenticated_user = Some(username.clone());
+                            presence.joined(username.clone());
                             let profile = user_profile(&store, &username);
                             send_response(&mut writer, ServerMessage::Authenticated {
                                 username,
@@ -471,6 +521,7 @@ async fn handle_connection(
                         }
                     }
                     ClientMessage::Logout => {
+                        presence.left();
                         authenticated_user = None;
                         send_response(&mut writer, ServerMessage::LoggedOut).await?;
                     }
@@ -636,6 +687,16 @@ async fn handle_connection(
                         }
                         if authenticated_user.is_some() {
                             send_response(&mut writer, ServerMessage::ProfileUpdated(profile)).await?;
+                        }
+                    }
+                    Ok(Broadcast::UserJoined { username }) => {
+                        if authenticated_user.is_some() {
+                            send_response(&mut writer, ServerMessage::UserJoined { username }).await?;
+                        }
+                    }
+                    Ok(Broadcast::UserLeft { username }) => {
+                        if authenticated_user.is_some() {
+                            send_response(&mut writer, ServerMessage::UserLeft { username }).await?;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -807,6 +868,30 @@ mod tests {
         assert!(!verify_password("wrong password", &first));
     }
 
+    #[test]
+    fn account_hash_survives_store_save_and_reload() -> io::Result<()> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_nanos();
+        let test_dir = std::env::temp_dir().join(format!("glefchat-store-test-{nonce}"));
+        let store_path = test_dir.join("server-users.json");
+        let password = "correct horse battery staple";
+        let mut store = UserStore::default();
+        store
+            .users
+            .insert("alice".to_string(), hash_password(password).unwrap());
+        store.store_path = Some(store_path.clone());
+        store.save()?;
+
+        let restored = UserStore::load_from(&store_path, HashSet::new())?;
+        let hash = restored.users.get("alice").expect("account was persisted");
+        assert!(verify_password(password, hash));
+
+        std::fs::remove_dir_all(test_dir)?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn tls_authenticates_users_and_server_assigns_message_authors() -> io::Result<()> {
         let nonce = SystemTime::now()
@@ -816,6 +901,7 @@ mod tests {
         let test_dir = std::env::temp_dir().join(format!("glefchat-tls-test-{nonce}"));
         let cert_path = test_dir.join("server-cert.pem");
         let key_path = test_dir.join("server-key.pem");
+        let users_path = test_dir.join("server-users.json");
         let acceptor = tls_acceptor_with_paths(&cert_path, &key_path)?;
 
         let certificates = rustls_pemfile::certs(&mut BufReader::new(File::open(&cert_path)?))
@@ -838,23 +924,30 @@ mod tests {
                 hash_password("correct horse battery staple").unwrap(),
             )]),
             profiles: HashMap::new(),
-            roles: HashMap::new(),
+            roles: HashMap::from([("alice".to_string(), UserRole::Member)]),
             banned_users: HashSet::new(),
             bootstrap_admins: HashSet::new(),
+            store_path: Some(users_path.clone()),
         }));
         let server_tx = tx.clone();
         let server_users = users.clone();
         let server = tokio::spawn(async move {
-            let (stream, addr) = listener.accept().await?;
-            let stream = acceptor.accept(stream).await?;
-            handle_connection(
-                stream,
-                addr,
-                server_tx.clone(),
-                server_tx.subscribe(),
-                server_users,
-            )
-            .await
+            let mut connections = tokio::task::JoinSet::new();
+            for _ in 0..2 {
+                let (stream, addr) = listener.accept().await?;
+                let stream = acceptor.accept(stream).await?;
+                let connection_tx = server_tx.clone();
+                let connection_rx = connection_tx.subscribe();
+                let connection_users = server_users.clone();
+                connections.spawn(async move {
+                    handle_connection(stream, addr, connection_tx, connection_rx, connection_users)
+                        .await
+                });
+            }
+            while let Some(result) = connections.join_next().await {
+                result.map_err(io::Error::other)??;
+            }
+            Ok::<(), io::Error>(())
         });
 
         let stream = TcpStream::connect(address).await?;
@@ -887,6 +980,10 @@ mod tests {
             read_message(&mut reader).await?,
             ServerMessage::Authenticated { username, role, .. }
                 if username == "alice" && role == UserRole::Member
+        ));
+        assert!(matches!(
+            read_message(&mut reader).await?,
+            ServerMessage::UserJoined { username } if username == "alice"
         ));
 
         send_message(
@@ -961,9 +1058,59 @@ mod tests {
                 if author == "alice" && content == "authenticated message"
         ));
 
+        let stream = TcpStream::connect(address).await?;
+        let server_name = ServerName::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST).into());
+        let stream = connector.connect(server_name, stream).await?;
+        let (bob_reader, mut bob_writer) = tokio::io::split(stream);
+        let mut bob_reader = AsyncBufReader::new(bob_reader);
+        send_message(
+            &mut bob_writer,
+            &ClientMessage::Register {
+                username: "bob".to_string(),
+                password: "another correct horse".to_string(),
+            },
+        )
+        .await?;
+        assert!(matches!(
+            read_message(&mut bob_reader).await?,
+            ServerMessage::Authenticated { username, .. } if username == "bob"
+        ));
+        assert!(matches!(
+            read_message(&mut bob_reader).await?,
+            ServerMessage::UserJoined { username } if username == "bob"
+        ));
+        assert!(matches!(
+            read_message(&mut reader).await?,
+            ServerMessage::UserJoined { username } if username == "bob"
+        ));
+
+        send_message(&mut bob_writer, &ClientMessage::Logout).await?;
+        assert!(matches!(
+            read_message(&mut bob_reader).await?,
+            ServerMessage::LoggedOut
+        ));
+        assert!(matches!(
+            read_message(&mut reader).await?,
+            ServerMessage::UserLeft { username } if username == "bob"
+        ));
+
+        drop(bob_writer);
+        drop(bob_reader);
         drop(writer);
         drop(reader);
         server.await.map_err(io::Error::other)??;
+
+        let restored = UserStore::load_from(&users_path, HashSet::new())?;
+        assert!(restored.users.contains_key("alice"));
+        assert!(restored.users.contains_key("bob"));
+        assert!(verify_password(
+            "another correct horse",
+            &restored.users["bob"]
+        ));
+        assert_eq!(
+            restored.profiles["alice"].picture.as_deref(),
+            Some(picture.as_str())
+        );
 
         std::fs::remove_dir_all(test_dir)?;
         Ok(())
