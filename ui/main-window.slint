@@ -14,6 +14,12 @@ export struct ThemeColor {
     value: color,
 }
 
+export struct ChannelView {
+    id: string,
+    name: string,
+    topic: string,
+}
+
 component ChatScrollView inherits ScrollView {
     in property <int> scroll-request: 0;
 
@@ -24,11 +30,18 @@ component ChatScrollView inherits ScrollView {
 
 export component MainWindow inherits Window {
     title: "GlefChat";
-    width: 1280px;
-    height: 780px;
+    preferred-width: 1280px;
+    preferred-height: 780px;
+    min-width: 760px;
+    min-height: 560px;
     background: root.theme-colors[23].value;
     
     in-out property <[Message]> messages;
+    in-out property <[ChannelView]> channels;
+    in-out property <[string]> channel-names;
+    in-out property <string> selected-channel-id: "";
+    in-out property <string> selected-channel-name: "";
+    in-out property <string> selected-channel-topic: "";
     in-out property <string> username: "";
     in-out property <bool> logged-in: false;
     in-out property <string> auth-error: "";
@@ -53,6 +66,9 @@ export component MainWindow inherits Window {
     in-out property <bool> follow-chat-bottom: true;
     in-out property <int> chat-scroll-request: 0;
     callback send-message(string);
+    callback select-channel(string);
+    callback create-channel(string, string);
+    callback edit-channel(string, string, string);
     callback login(string, string);
     callback register(string, string);
     callback log-out();
@@ -66,66 +82,74 @@ export component MainWindow inherits Window {
     
     if !root.logged-in : Rectangle {
         background: root.theme-colors[23].value;
-        
-        Rectangle {
-            width: 380px;
-            height: 320px;
-            background: root.theme-colors[22].value;
-            border-radius: 14px;
-            
-            VerticalBox {
-                padding: 28px;
-                spacing: 14px;
+
+        VerticalBox {
+            alignment: center;
+
+            HorizontalBox {
                 alignment: center;
-                
-                Text {
-                    text: "GlefChat";
-                    font-size: 26px;
-                    font-weight: 700;
-                    color: root.theme-colors[13].value;
-                    horizontal-alignment: center;
-                }
-                
-                Text {
-                    text: "Sign in or create a profile";
-                    font-size: 13px;
-                    color: root.theme-colors[16].value;
-                    horizontal-alignment: center;
-                }
-                
-                username-input := LineEdit {
-                    placeholder-text: "Username";
-                }
-                
-                password-input := LineEdit {
-                    placeholder-text: "Password";
-                    input-type: password;
-                    accepted(text) => {
-                        root.login(username-input.text, text);
-                    }
-                }
-                
-                if root.auth-error != "" : Text {
-                    text: root.auth-error;
-                    font-size: 12px;
-                    color: root.theme-colors[4].value;
-                    horizontal-alignment: center;
-                    wrap: word-wrap;
-                }
-                
-                HorizontalBox {
-                    Button {
-                        text: "Log In";
-                        primary: true;
-                        clicked => {
-                            root.login(username-input.text, password-input.text);
+
+                Rectangle {
+                    width: 380px;
+                    height: 320px;
+                    background: root.theme-colors[22].value;
+                    border-radius: 14px;
+
+                    VerticalBox {
+                        padding: 28px;
+                        spacing: 14px;
+                        alignment: center;
+
+                        Text {
+                            text: "GlefChat";
+                            font-size: 26px;
+                            font-weight: 700;
+                            color: root.theme-colors[13].value;
+                            horizontal-alignment: center;
                         }
-                    }
-                    
-                    Button {
-                        text: "Register";
-                        clicked => {
-                            root.register(username-input.text, password-input.text);
+
+                        Text {
+                            text: "Sign in or create a profile";
+                            font-size: 13px;
+                            color: root.theme-colors[16].value;
+                            horizontal-alignment: center;
+                        }
+
+                        username-input := LineEdit {
+                            placeholder-text: "Username";
+                        }
+
+                        password-input := LineEdit {
+                            placeholder-text: "Password";
+                            input-type: password;
+                            accepted(text) => {
+                                root.login(username-input.text, text);
+                            }
+                        }
+
+                        if root.auth-error != "" : Text {
+                            text: root.auth-error;
+                            font-size: 12px;
+                            color: root.theme-colors[4].value;
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalBox {
+                            Button {
+                                text: "Log In";
+                                primary: true;
+                                clicked => {
+                                    root.login(username-input.text, password-input.text);
+                                }
+                            }
+
+                            Button {
+                                text: "Register";
+                                clicked => {
+                                    root.register(username-input.text, password-input.text);
+                                }
+                            }
                         }
                     }
                 }
@@ -134,13 +158,13 @@ export component MainWindow inherits Window {
     }
     
     if root.logged-in : VerticalBox {
-        padding: 20px;
-        spacing: 16px;
+        padding: 18px;
+        spacing: 14px;
         
         Rectangle {
             background: root.theme-colors[22].value;
-            height: 60px;
-            border-radius: 10px;
+            height: 64px;
+            border-radius: 12px;
             
             HorizontalBox {
                 padding-left: 14px;
@@ -148,7 +172,7 @@ export component MainWindow inherits Window {
                 
                 Text {
                     text: "GlefChat";
-                    font-size: 22px;
+                    font-size: 23px;
                     font-weight: 700;
                     color: root.theme-colors[13].value;
                     vertical-alignment: center;
@@ -158,7 +182,7 @@ export component MainWindow inherits Window {
                 
                 Text {
                     text: "Signed in as " + root.username + " (" + root.account-role + ")";
-                    font-size: 14px;
+                    font-size: 13px;
                     color: root.theme-colors[16].value;
                     vertical-alignment: center;
                 }
@@ -195,7 +219,7 @@ export component MainWindow inherits Window {
         if root.viewed-profile-open : Rectangle {
             height: root.account-role == "Admin" ? 190px : (root.account-role == "Moderator" ? 150px : 112px);
             background: root.theme-colors[22].value;
-            border-radius: 10px;
+            border-radius: 12px;
 
             HorizontalBox {
                 padding: 10px;
@@ -448,24 +472,138 @@ export component MainWindow inherits Window {
             }
         }
 
-        if !root.theme-editor-open && !root.profile-editor-open : chat-panel := Rectangle {
-            property <bool> follow-chat-bottom: true;
-            background: root.theme-colors[22].value;
-            border-radius: 10px;
+        if !root.theme-editor-open && !root.profile-editor-open : HorizontalBox {
+            alignment: stretch;
+            cross-axis-self-alignment: stretch;
+            horizontal-stretch: 1;
+            width: 100%;
+            vertical-stretch: 1;
+            spacing: 14px;
+
+            Rectangle {
+                width: 190px;
+                background: root.theme-colors[22].value;
+                border-radius: 10px;
+
+                VerticalBox {
+                    padding: 10px;
+                    spacing: 8px;
+
+                    Text {
+                        text: "Channels";
+                        font-size: 16px;
+                        font-weight: 700;
+                        color: root.theme-colors[13].value;
+                    }
+
+                    ScrollView {
+                        VerticalBox {
+                            spacing: 4px;
+
+                            for channel in root.channels : Button {
+                                height: 30px;
+                                text: "# " + channel.name;
+                                primary: channel.id == root.selected-channel-id;
+                                clicked => { root.select-channel(channel.name); }
+                            }
+                        }
+                    }
+                }
+            }
+
+            chat-panel := Rectangle {
+                property <bool> follow-chat-bottom: true;
+                horizontal-stretch: 1;
+                background: root.theme-colors[22].value;
+                border-radius: 12px;
 
             VerticalBox {
                 padding: 14px;
                 spacing: 10px;
+                width: 100%;
+
+                HorizontalBox {
+                    spacing: 8px;
+
+                    ComboBox {
+                        width: 170px;
+                        model: root.channel-names;
+                        current-value: root.selected-channel-name;
+                        selected(value) => { root.select-channel(value); }
+                    }
+
+                    Rectangle { }
+
+                    Text {
+                        text: root.selected-channel-topic;
+                        color: root.theme-colors[16].value;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+
+                if root.account-role != "Member" : HorizontalBox {
+                    spacing: 8px;
+
+                    channel_name_input := LineEdit {
+                        width: 160px;
+                        placeholder-text: "Channel name";
+                        text: root.selected-channel-name;
+                    }
+
+                    channel_topic_input := LineEdit {
+                        width: 220px;
+                        placeholder-text: "Channel topic";
+                        text: root.selected-channel-topic;
+                    }
+
+                    Button {
+                        text: "Save";
+                        enabled: root.selected-channel-id != "";
+                        clicked => {
+                            root.edit-channel(root.selected-channel-id, channel_name_input.text, channel_topic_input.text);
+                        }
+                    }
+                }
+
+                if root.account-role != "Member" : HorizontalBox {
+                    spacing: 8px;
+
+                    new_channel_name_input := LineEdit {
+                        width: 160px;
+                        placeholder-text: "New channel name";
+                    }
+
+                    new_channel_topic_input := LineEdit {
+                        width: 220px;
+                        placeholder-text: "New channel topic";
+                    }
+
+                    Button {
+                        text: "Create";
+                        clicked => {
+                            root.create-channel(new_channel_name_input.text, new_channel_topic_input.text);
+                        }
+                    }
+                }
+
+                if root.auth-error != "" : Text {
+                    text: root.auth-error;
+                    font-size: 12px;
+                    color: root.theme-colors[4].value;
+                    wrap: word-wrap;
+                }
 
                 Rectangle {
                     background: root.theme-colors[24].value;
-                    border-radius: 10px;
+                    border-radius: 12px;
     
                     chat-scroll := ChatScrollView {
                         scroll-request: root.chat-scroll-request;
 
                         changed content-height => {
-                            if (chat-panel.follow-chat-bottom) {
+                            if (root.follow-chat-bottom) {
                                 chat-scroll.content-y = chat-scroll.content-height;
                             }
                         }
@@ -488,6 +626,7 @@ export component MainWindow inherits Window {
                             
                             for message[index] in root.messages : HorizontalBox {
                                 padding: 0px;
+                                spacing: 8px;
                                 alignment: message.is-system ? center : (message.author == root.username ? end : start);
 
                                 if message.is-system : Text {
@@ -519,9 +658,10 @@ export component MainWindow inherits Window {
                                 }
                                 
                                 if !message.is-system : Rectangle {
+                                    min-width: 64px;
                                     max-width: 700px;
                                     background: message.author == root.username ? root.theme-colors[3].value : root.theme-colors[21].value;
-                                    border-radius: 14px;
+                                    border-radius: 12px;
                                     
                                     VerticalBox {
                                         padding: 10px;
@@ -583,14 +723,16 @@ export component MainWindow inherits Window {
                 
                 Rectangle {
                     background: root.theme-colors[21].value;
-                    height: 52px;
-                    border-radius: 10px;
+                    height: 56px;
+                    border-radius: 12px;
 
                     HorizontalBox {
                         padding-left: 10px;
                         padding-right: 10px;
+                        spacing: 8px;
                         
                         input := LineEdit {
+                            height: 36px;
                             placeholder-text: "Type a message…";
                             accepted(text) => {
                                 root.send-message(text);
@@ -600,6 +742,7 @@ export component MainWindow inherits Window {
 
                         Button {
                             text: "Send";
+                            height: 36px;
                             enabled: input.text != "";
                             clicked => {
                                 root.send-message(input.text);
@@ -608,6 +751,7 @@ export component MainWindow inherits Window {
                         }
                     }
                 }
+            }
             }
         }
     }

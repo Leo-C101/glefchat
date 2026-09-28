@@ -1,6 +1,18 @@
 use serde::{Deserialize, Serialize};
 
 pub const MAX_PROFILE_IMAGE_SIZE: usize = 512 * 1024;
+pub const DEFAULT_CHANNEL_ID: &str = "1";
+
+pub fn default_channel_id() -> String {
+    DEFAULT_CHANNEL_ID.to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Channel {
+    pub id: String,
+    pub name: String,
+    pub topic: String,
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -25,7 +37,10 @@ impl UserRole {
     pub fn has_permission(self, permission: Permission) -> bool {
         match self {
             Self::Member => false,
-            Self::Moderator => permission == Permission::BanUsers,
+            Self::Moderator => matches!(
+                permission,
+                Permission::BanUsers | Permission::ManageChannels
+            ),
             Self::Admin => true,
         }
     }
@@ -62,7 +77,18 @@ pub enum ClientMessage {
     },
     Logout,
     SendMessage {
+        #[serde(default = "default_channel_id")]
+        channel_id: String,
         content: String,
+    },
+    CreateChannel {
+        name: String,
+        topic: String,
+    },
+    EditChannel {
+        channel_id: String,
+        name: String,
+        topic: String,
     },
     GetProfile {
         username: String,
@@ -109,8 +135,13 @@ pub enum ServerMessage {
     },
     LoggedOut,
     ChatMessage {
+        #[serde(default = "default_channel_id")]
+        channel_id: String,
         author: String,
         content: String,
+    },
+    Channels {
+        channels: Vec<Channel>,
     },
     UserJoined {
         username: String,

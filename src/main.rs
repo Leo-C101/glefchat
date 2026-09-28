@@ -50,6 +50,8 @@ const MAX_STORED_MESSAGES: usize = 500;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct StoredMessage {
+    #[serde(default = "protocol::default_channel_id")]
+    channel_id: String,
     author: String,
     content: String,
     timestamp: String,
@@ -229,7 +231,7 @@ fn preferred_accent(overrides: Option<&HashMap<String, String>>) -> (&'static st
 
 fn users_file_path() -> PathBuf {
     let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-    base.join("glefchat").join("users.json")
+    base.join("oxide").join("users.json")
 }
 
 fn load_user_store() -> UserStore {
@@ -249,7 +251,7 @@ fn save_user_store(store: &UserStore) -> std::io::Result<()> {
 
 fn messages_file_path() -> PathBuf {
     let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-    base.join("glefchat").join("messages.json")
+    base.join("oxide").join("messages.json")
 }
 
 fn load_messages() -> Vec<StoredMessage> {
@@ -273,7 +275,7 @@ fn tls_certificate_path() -> PathBuf {
         .unwrap_or_else(|| {
             dirs::config_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
-                .join("glefchat")
+                .join("oxide")
                 .join("server-cert.pem")
         })
 }
@@ -324,6 +326,7 @@ fn main() -> Result<(), slint::PlatformError> {
         .lock()
         .unwrap()
         .iter()
+        .filter(|stored| stored.channel_id == protocol::DEFAULT_CHANNEL_ID)
         .map(|stored| {
             let mut message = Message::from(stored);
             if let Some(profile) = profiles.get(&stored.author) {
@@ -335,6 +338,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let model_rc: ModelRc<Message> = ModelRc::new(VecModel::from(messages));
     main_window.set_messages(model_rc);
+    main_window.set_selected_channel_id(protocol::DEFAULT_CHANNEL_ID.into());
     main_window.set_theme_colors(ModelRc::new(VecModel::from(theme_colors(None))));
     main_window
         .set_editable_theme_colors(ModelRc::new(VecModel::from(editable_theme_colors(None))));
@@ -606,6 +610,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
     {
         let window = main_window.as_weak();
+        let outgoing_tx = outgoing_tx.clone();
         main_window.on_send_message(move |content| {
             let content = content.to_string();
             if content.is_empty() || content.len() > 4096 {
@@ -613,7 +618,52 @@ fn main() -> Result<(), slint::PlatformError> {
             }
             let Some(win) = window.upgrade() else { return };
             if win.get_logged_in() {
-                let _ = outgoing_tx.send(ClientMessage::SendMessage { content });
+                let _ = outgoing_tx.send(ClientMessage::SendMessage {
+                    channel_id: win.get_selected_channel_id().to_string(),
+                    content,
+                });
+            }
+        });
+    }
+
+    {
+        let window = main_window.as_weak();
+        let stored_messages = stored_messages.clone();
+        let user_store = user_store.clone();
+        main_window.on_select_channel(move |name| {
+            let Some(win) = window.upgrade() else { return };
+            let channels = win.get_channels();
+            let Some(channel) = channels.iter().find(|channel| channel.name == name) else {
+                return;
+            };
+            win.set_selected_channel_id(channel.id.clone());
+            win.set_selected_channel_name(channel.name.clone());
+            win.set_selected_channel_topic(channel.topic.clone());
+            refresh_visible_messages(&win, &stored_messages, &user_store);
+        });
+    }
+
+    {
+        let outgoing_tx = outgoing_tx.clone();
+        main_window.on_create_channel(move |name, topic| {
+            let _ = outgoing_tx.send(ClientMessage::CreateChannel {
+                name: name.to_string(),
+                topic: topic.to_string(),
+            });
+        });
+    }
+
+    {
+        let window = main_window.as_weak();
+        let outgoing_tx = outgoing_tx.clone();
+        main_window.on_edit_channel(move |channel_id, name, topic| {
+            if let Some(win) = window.upgrade() {
+                let _ = outgoing_tx.send(ClientMessage::EditChannel {
+                    channel_id: channel_id.to_string(),
+                    name: name.to_string(),
+                    topic: topic.to_string(),
+                });
+                win.set_auth_error("".into());
             }
         });
     }
@@ -902,7 +952,9 @@ fn append_stored_message(
 ) {
     let follow_chat_bottom = window.get_follow_chat_bottom();
     let model = window.get_messages();
-    if let Some(vec_model) = model.as_any().downcast_ref::<VecModel<Message>>() {
+    if stored.channel_id == window.get_selected_channel_id().as_str()
+        && let Some(vec_model) = model.as_any().downcast_ref::<VecModel<Message>>()
+    {
         let mut message = Message::from(&stored);
         if !stored.is_system
             && let Some(profile) = user_store.lock().unwrap().profiles.get(&stored.author)
@@ -945,12 +997,36 @@ fn append_presence_message(
         user_store,
         stored_messages,
         StoredMessage {
+            channel_id: protocol::DEFAULT_CHANNEL_ID.to_string(),
             author: String::new(),
             content: format!("{username} {verb} the chat"),
             timestamp: current_timestamp(),
             is_system: true,
         },
     );
+}
+
+fn refresh_visible_messages(
+    window: &MainWindow,
+    stored_messages: &Arc<Mutex<Vec<StoredMessage>>>,
+    user_store: &Arc<Mutex<UserStore>>,
+) {
+    let channel_id = window.get_selected_channel_id().to_string();
+    let profiles = user_store.lock().unwrap().profiles.clone();
+    let messages = stored_messages
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|stored| stored.channel_id == channel_id)
+        .map(|stored| {
+            let mut message = Message::from(stored);
+            if let Some(profile) = profiles.get(&stored.author) {
+                message.profile_picture = profile_image(&profile.picture);
+            }
+            message
+        })
+        .collect::<Vec<_>>();
+    window.set_messages(ModelRc::new(VecModel::from(messages)));
 }
 
 fn apply_server_message(
@@ -1059,14 +1135,46 @@ fn apply_server_message(
             ServerMessage::UserLeft { username } => {
                 append_presence_message(&window, &user_store, &stored_messages, username, false);
             }
-            ServerMessage::ChatMessage { author, content } => {
+            ServerMessage::ChatMessage {
+                channel_id,
+                author,
+                content,
+            } => {
                 let stored = StoredMessage {
+                    channel_id,
                     author: author.clone(),
                     content: content.clone(),
                     timestamp: current_timestamp(),
                     is_system: false,
                 };
                 append_stored_message(&window, &user_store, &stored_messages, stored);
+            }
+            ServerMessage::Channels { channels } => {
+                let names = channels
+                    .iter()
+                    .map(|channel| channel.name.clone().into())
+                    .collect::<Vec<_>>();
+                let views = channels
+                    .iter()
+                    .map(|channel| ChannelView {
+                        id: channel.id.clone().into(),
+                        name: channel.name.clone().into(),
+                        topic: channel.topic.clone().into(),
+                    })
+                    .collect::<Vec<_>>();
+                window.set_channels(ModelRc::new(VecModel::from(views)));
+                window.set_channel_names(ModelRc::new(VecModel::from(names)));
+                let selected_id = window.get_selected_channel_id().to_string();
+                if let Some(channel) = channels
+                    .iter()
+                    .find(|channel| channel.id == selected_id)
+                    .or_else(|| channels.first())
+                {
+                    window.set_selected_channel_id(channel.id.clone().into());
+                    window.set_selected_channel_name(channel.name.clone().into());
+                    window.set_selected_channel_topic(channel.topic.clone().into());
+                }
+                refresh_visible_messages(&window, &stored_messages, &user_store);
             }
         }
     });
@@ -1113,6 +1221,7 @@ mod tests {
             serde_json::from_str(r#"{"author":"alice","content":"hello","timestamp":"12:00"}"#)
                 .unwrap();
         assert!(!message.is_system);
+        assert_eq!(message.channel_id, protocol::DEFAULT_CHANNEL_ID);
     }
 
     #[test]

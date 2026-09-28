@@ -2,7 +2,8 @@ use argon2::Argon2;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash};
 use base64::Engine;
 use protocol::{
-    ClientMessage, MAX_PROFILE_IMAGE_SIZE, Permission, ServerMessage, UserProfile, UserRole,
+    Channel, ClientMessage, MAX_PROFILE_IMAGE_SIZE, Permission, ServerMessage, UserProfile,
+    UserRole,
 };
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -26,8 +27,23 @@ const MAX_PASSWORD_LENGTH: usize = 1024;
 const MAX_MESSAGE_LENGTH: usize = 4096;
 const MAX_REQUEST_LENGTH: usize = 1_500_000;
 const MAX_CONNECTIONS: usize = 128;
+const MAX_CHANNELS: usize = 100;
+const MAX_CHANNEL_NAME_LENGTH: usize = 32;
+const MAX_CHANNEL_TOPIC_LENGTH: usize = 160;
 
-#[derive(Default, Serialize, Deserialize)]
+fn default_channels() -> Vec<Channel> {
+    vec![Channel {
+        id: protocol::DEFAULT_CHANNEL_ID.to_string(),
+        name: "general".to_string(),
+        topic: "General conversation".to_string(),
+    }]
+}
+
+fn default_next_channel_id() -> u64 {
+    2
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct UserStore {
     users: HashMap<String, String>,
     #[serde(default)]
@@ -36,6 +52,10 @@ struct UserStore {
     roles: HashMap<String, UserRole>,
     #[serde(default)]
     banned_users: HashSet<String>,
+    #[serde(default)]
+    channels: Vec<Channel>,
+    #[serde(default = "default_next_channel_id")]
+    next_channel_id: u64,
     #[serde(skip)]
     bootstrap_admins: HashSet<String>,
     #[serde(skip)]
@@ -44,10 +64,19 @@ struct UserStore {
 
 #[derive(Clone)]
 enum Broadcast {
-    ChatMessage { author: String, content: String },
+    ChatMessage {
+        channel_id: String,
+        author: String,
+        content: String,
+    },
+    Channels(Vec<Channel>),
     ProfileUpdated(UserProfile),
-    UserJoined { username: String },
-    UserLeft { username: String },
+    UserJoined {
+        username: String,
+    },
+    UserLeft {
+        username: String,
+    },
 }
 
 struct OnlinePresence {
@@ -87,6 +116,17 @@ fn valid_profile_image(image: &Option<String>) -> bool {
             .decode(image)
             .is_ok_and(|bytes| !bytes.is_empty() && bytes.len() <= MAX_PROFILE_IMAGE_SIZE)
     })
+}
+
+fn valid_channel_name(name: &str) -> bool {
+    (1..=MAX_CHANNEL_NAME_LENGTH).contains(&name.len())
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+}
+
+fn valid_channel_topic(topic: &str) -> bool {
+    topic.len() <= MAX_CHANNEL_TOPIC_LENGTH && !topic.chars().any(char::is_control)
 }
 
 fn user_profile(store: &UserStore, username: &str) -> UserProfile {
@@ -166,6 +206,14 @@ impl UserStore {
                 changed = true;
             }
         }
+        if store.channels.is_empty() {
+            store.channels = default_channels();
+            changed = true;
+        }
+        if store.next_channel_id == 0 {
+            store.next_channel_id = default_next_channel_id();
+            changed = true;
+        }
         if changed {
             store.save()?;
         }
@@ -191,7 +239,7 @@ impl UserStore {
 
 fn app_data_dir() -> io::Result<PathBuf> {
     dirs::config_dir()
-        .map(|path| path.join("glefchat"))
+        .map(|path| path.join("oxide"))
         .ok_or_else(|| io::Error::other("could not locate the user config directory"))
 }
 
@@ -351,7 +399,7 @@ async fn main() -> io::Result<()> {
     let (tx, _) = broadcast::channel::<Broadcast>(100);
     let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
-    println!("GlefChat server listening on {bind_addr} with TLS");
+    println!("Oxide server listening on {bind_addr} with TLS");
     loop {
         let (stream, addr) = listener.accept().await?;
         println!("New connection: {addr}");
@@ -472,6 +520,9 @@ async fn handle_connection(
                                     banner: profile.banner,
                                     role: profile.role,
                                 }).await?;
+                                send_response(&mut writer, ServerMessage::Channels {
+                                    channels: store.channels.clone(),
+                                }).await?;
                             }
                         }
                     }
@@ -513,6 +564,9 @@ async fn handle_connection(
                                 banner: profile.banner,
                                 role: profile.role,
                             }).await?;
+                            send_response(&mut writer, ServerMessage::Channels {
+                                channels: store.channels.clone(),
+                            }).await?;
                         } else {
                             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                             send_response(&mut writer, ServerMessage::AuthenticationFailed {
@@ -525,23 +579,145 @@ async fn handle_connection(
                         authenticated_user = None;
                         send_response(&mut writer, ServerMessage::LoggedOut).await?;
                     }
-                    ClientMessage::SendMessage { content } => {
+                    ClientMessage::SendMessage { channel_id, content } => {
                         let Some(author) = authenticated_user.as_ref() else {
                             send_response(&mut writer, ServerMessage::AuthenticationFailed {
                                 message: "Sign in before sending messages.".to_string(),
                             }).await?;
                             continue;
                         };
-                        if content.is_empty() || content.len() > MAX_MESSAGE_LENGTH {
+                        if !users.lock().await.channels.iter().any(|channel| channel.id == channel_id) {
+                            send_response(&mut writer, ServerMessage::Error {
+                                message: "That channel does not exist.".to_string(),
+                            }).await?;
+                        } else if content.is_empty() || content.len() > MAX_MESSAGE_LENGTH {
                             send_response(&mut writer, ServerMessage::Error {
                                 message: "Messages must contain 1-4096 bytes.".to_string(),
                             }).await?;
                         } else {
                             let _ = tx.send(Broadcast::ChatMessage {
+                                channel_id,
                                 author: author.clone(),
                                 content,
                             });
                         }
+                    }
+                    ClientMessage::CreateChannel { name, topic } => {
+                        let Some(actor) = authenticated_user.as_ref() else {
+                            send_response(&mut writer, ServerMessage::AuthenticationFailed {
+                                message: "Sign in before managing channels.".to_string(),
+                            }).await?;
+                            continue;
+                        };
+                        let name = name.trim().to_ascii_lowercase();
+                        let topic = topic.trim().to_string();
+                        let mut store = users.lock().await;
+                        let actor_role = store.roles.get(actor).copied().unwrap_or_default();
+                        if !actor_role.has_permission(Permission::ManageChannels) {
+                            send_response(&mut writer, ServerMessage::Error {
+                                message: "You do not have permission to manage channels.".to_string(),
+                            }).await?;
+                            continue;
+                        }
+                        if !valid_channel_name(&name) || !valid_channel_topic(&topic) {
+                            send_response(&mut writer, ServerMessage::Error {
+                                message: "Channel names must be 1-32 lowercase letters, numbers, dashes, or underscores; topics may contain up to 160 characters.".to_string(),
+                            }).await?;
+                            continue;
+                        }
+                        if store.channels.len() >= MAX_CHANNELS {
+                            send_response(&mut writer, ServerMessage::Error {
+                                message: "The server has reached its channel limit.".to_string(),
+                            }).await?;
+                            continue;
+                        }
+                        if store.channels.iter().any(|channel| channel.name == name) {
+                            send_response(&mut writer, ServerMessage::Error {
+                                message: "A channel with that name already exists.".to_string(),
+                            }).await?;
+                            continue;
+                        }
+                        let previous_next_id = store.next_channel_id;
+                        let Some(next_id) = previous_next_id.checked_add(1) else {
+                            send_response(&mut writer, ServerMessage::Error {
+                                message: "No more channel IDs are available.".to_string(),
+                            }).await?;
+                            continue;
+                        };
+                        store.channels.push(Channel {
+                            id: previous_next_id.to_string(),
+                            name,
+                            topic,
+                        });
+                        store.next_channel_id = next_id;
+                        let snapshot = store.clone();
+                        let channels = store.channels.clone();
+                        drop(store);
+                        if let Err(err) = tokio::task::spawn_blocking(move || snapshot.save())
+                            .await
+                            .map_err(io::Error::other)?
+                        {
+                            let mut store = users.lock().await;
+                            store.channels.pop();
+                            store.next_channel_id = previous_next_id;
+                            return Err(err);
+                        }
+                        let _ = tx.send(Broadcast::Channels(channels));
+                    }
+                    ClientMessage::EditChannel { channel_id, name, topic } => {
+                        let Some(actor) = authenticated_user.as_ref() else {
+                            send_response(&mut writer, ServerMessage::AuthenticationFailed {
+                                message: "Sign in before managing channels.".to_string(),
+                            }).await?;
+                            continue;
+                        };
+                        let name = name.trim().to_ascii_lowercase();
+                        let topic = topic.trim().to_string();
+                        let mut store = users.lock().await;
+                        let actor_role = store.roles.get(actor).copied().unwrap_or_default();
+                        if !actor_role.has_permission(Permission::ManageChannels) {
+                            send_response(&mut writer, ServerMessage::Error {
+                                message: "You do not have permission to manage channels.".to_string(),
+                            }).await?;
+                            continue;
+                        }
+                        if !valid_channel_name(&name) || !valid_channel_topic(&topic) {
+                            send_response(&mut writer, ServerMessage::Error {
+                                message: "Channel names must be 1-32 lowercase letters, numbers, dashes, or underscores; topics may contain up to 160 characters.".to_string(),
+                            }).await?;
+                            continue;
+                        }
+                        let Some(index) = store.channels.iter().position(|channel| channel.id == channel_id) else {
+                            send_response(&mut writer, ServerMessage::Error {
+                                message: "That channel does not exist.".to_string(),
+                            }).await?;
+                            continue;
+                        };
+                        if store.channels.iter().any(|channel| channel.id != channel_id && channel.name == name) {
+                            send_response(&mut writer, ServerMessage::Error {
+                                message: "A channel with that name already exists.".to_string(),
+                            }).await?;
+                            continue;
+                        }
+                        let previous = store.channels[index].clone();
+                        store.channels[index].name = name.clone();
+                        store.channels[index].topic = topic.clone();
+                        let snapshot = store.clone();
+                        let channels = store.channels.clone();
+                        drop(store);
+                        if let Err(err) = tokio::task::spawn_blocking(move || snapshot.save())
+                            .await
+                            .map_err(io::Error::other)?
+                        {
+                            let mut store = users.lock().await;
+                            if let Some(channel) = store.channels.iter_mut().find(|channel| channel.id == channel_id) {
+                                if channel.name == name && channel.topic == topic {
+                                    *channel = previous;
+                                }
+                            }
+                            return Err(err);
+                        }
+                        let _ = tx.send(Broadcast::Channels(channels));
                     }
                     ClientMessage::GetProfile { username } => {
                         if authenticated_user.is_none() {
@@ -671,9 +847,14 @@ async fn handle_connection(
             }
             result = rx.recv() => {
                 match result {
-                    Ok(Broadcast::ChatMessage { author, content }) => {
+                    Ok(Broadcast::ChatMessage { channel_id, author, content }) => {
                         if authenticated_user.is_some() {
-                            send_response(&mut writer, ServerMessage::ChatMessage { author, content }).await?;
+                            send_response(&mut writer, ServerMessage::ChatMessage { channel_id, author, content }).await?;
+                        }
+                    }
+                    Ok(Broadcast::Channels(channels)) => {
+                        if authenticated_user.is_some() {
+                            send_response(&mut writer, ServerMessage::Channels { channels }).await?;
                         }
                     }
                     Ok(Broadcast::ProfileUpdated(profile)) => {
@@ -715,11 +896,12 @@ async fn handle_connection(
 #[cfg(test)]
 mod tests {
     use super::{
-        UserStore, can_moderate_user, handle_connection, hash_password, parse_admin_usernames,
-        role_change_error, tls_acceptor_with_paths, valid_profile_image, valid_username,
+        UserStore, can_moderate_user, default_channels, default_next_channel_id, handle_connection,
+        hash_password, parse_admin_usernames, role_change_error, tls_acceptor_with_paths,
+        valid_channel_name, valid_channel_topic, valid_profile_image, valid_username,
         verify_password,
     };
-    use crate::protocol::{ClientMessage, ServerMessage, UserProfile};
+    use crate::protocol::{ClientMessage, DEFAULT_CHANNEL_ID, ServerMessage, UserProfile};
     use crate::protocol::{MAX_PROFILE_IMAGE_SIZE, Permission, UserRole};
     use base64::Engine;
     use rustls::pki_types::ServerName;
@@ -753,6 +935,132 @@ mod tests {
         serde_json::from_str(&line).map_err(io::Error::other)
     }
 
+    struct TestServer {
+        address: SocketAddr,
+        connector: TlsConnector,
+        handle: tokio::task::JoinHandle<io::Result<()>>,
+    }
+
+    impl TestServer {
+        async fn start(
+            test_dir: &Path,
+            roles: HashMap<String, UserRole>,
+        ) -> io::Result<Self> {
+            let cert_path = test_dir.join("server-cert.pem");
+            let key_path = test_dir.join("server-key.pem");
+            let users_path = test_dir.join("server-users.json");
+            let acceptor = tls_acceptor_with_paths(&cert_path, &key_path)?;
+
+            let certificates =
+                rustls_pemfile::certs(&mut BufReader::new(File::open(&cert_path)?))
+                    .collect::<Result<Vec<_>, _>>()?;
+            let mut roots = RootCertStore::empty();
+            for certificate in certificates {
+                roots.add(certificate).map_err(io::Error::other)?;
+            }
+            let config = ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            let connector = TlsConnector::from(Arc::new(config));
+
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let address = listener.local_addr()?;
+            let (tx, _) = broadcast::channel(8);
+
+            let mut users_map = HashMap::new();
+            for username in roles.keys() {
+                users_map.insert(
+                    username.clone(),
+                    hash_password("correct horse battery staple").unwrap(),
+                );
+            }
+            let users = Arc::new(Mutex::new(UserStore {
+                users: users_map,
+                profiles: HashMap::new(),
+                roles,
+                banned_users: HashSet::new(),
+                channels: default_channels(),
+                next_channel_id: default_next_channel_id(),
+                bootstrap_admins: HashSet::new(),
+                store_path: Some(users_path.clone()),
+            }));
+            let server_tx = tx.clone();
+            let server_users = users.clone();
+            let user_count = 4;
+            let handle = tokio::spawn(async move {
+                let mut connections = tokio::task::JoinSet::new();
+                for _ in 0..user_count {
+                    let (stream, addr) = listener.accept().await?;
+                    let stream = acceptor.accept(stream).await?;
+                    let connection_tx = server_tx.clone();
+                    let connection_rx = connection_tx.subscribe();
+                    let connection_users = server_users.clone();
+                    connections.spawn(async move {
+                        handle_connection(
+                            stream,
+                            addr,
+                            connection_tx,
+                            connection_rx,
+                            connection_users,
+                        )
+                        .await
+                    });
+                }
+                while let Some(result) = connections.join_next().await {
+                    result.map_err(io::Error::other)??;
+                }
+                Ok::<(), io::Error>(())
+            });
+
+            Ok(Self {
+                address,
+                connector,
+                handle,
+            })
+        }
+
+        async fn connect(
+            &self,
+        ) -> io::Result<(
+            AsyncBufReader<tokio::io::ReadHalf<tokio_rustls::client::TlsStream<TcpStream>>>,
+            tokio::io::WriteHalf<tokio_rustls::client::TlsStream<TcpStream>>,
+        )> {
+            let stream = TcpStream::connect(self.address).await?;
+            let server_name = ServerName::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST).into());
+            let stream = self.connector.connect(server_name, stream).await?;
+            let (reader, writer) = tokio::io::split(stream);
+            Ok((AsyncBufReader::new(reader), writer))
+        }
+    }
+
+    async fn login_as(
+        reader: &mut (impl AsyncBufRead + Unpin),
+        writer: &mut (impl AsyncWrite + Unpin),
+        username: &str,
+    ) -> io::Result<()> {
+        send_message(
+            writer,
+            &ClientMessage::Login {
+                username: username.to_string(),
+                password: "correct horse battery staple".to_string(),
+            },
+        )
+        .await?;
+        assert!(matches!(
+            read_message(reader).await?,
+            ServerMessage::Authenticated { .. }
+        ));
+        assert!(matches!(
+            read_message(reader).await?,
+            ServerMessage::Channels { .. }
+        ));
+        assert!(matches!(
+            read_message(reader).await?,
+            ServerMessage::UserJoined { .. }
+        ));
+        Ok(())
+    }
+
     #[test]
     fn username_validation_rejects_control_characters() {
         assert!(valid_username("alice_42"));
@@ -764,10 +1072,22 @@ mod tests {
     fn roles_grant_only_their_configured_permissions() {
         assert!(!UserRole::Member.has_permission(Permission::BanUsers));
         assert!(UserRole::Moderator.has_permission(Permission::BanUsers));
+        assert!(UserRole::Moderator.has_permission(Permission::ManageChannels));
         assert!(!UserRole::Moderator.has_permission(Permission::ManageRoles));
         assert!(UserRole::Admin.has_permission(Permission::ManageRoles));
         assert!(UserRole::Admin.has_permission(Permission::ManageChannels));
         assert!(UserRole::Admin.has_permission(Permission::ManageServerInfo));
+    }
+
+    #[test]
+    fn channel_names_and_topics_are_bounded_and_safe() {
+        assert!(valid_channel_name("general-2"));
+        assert!(!valid_channel_name("General"));
+        assert!(!valid_channel_name("two words"));
+        assert!(!valid_channel_name(&"a".repeat(33)));
+        assert!(valid_channel_topic("A useful topic"));
+        assert!(!valid_channel_topic("line\nbreak"));
+        assert!(!valid_channel_topic(&"a".repeat(161)));
     }
 
     #[test]
@@ -874,7 +1194,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock is after the Unix epoch")
             .as_nanos();
-        let test_dir = std::env::temp_dir().join(format!("glefchat-store-test-{nonce}"));
+        let test_dir = std::env::temp_dir().join(format!("oxide-store-test-{nonce}"));
         let store_path = test_dir.join("server-users.json");
         let password = "correct horse battery staple";
         let mut store = UserStore::default();
@@ -887,6 +1207,8 @@ mod tests {
         let restored = UserStore::load_from(&store_path, HashSet::new())?;
         let hash = restored.users.get("alice").expect("account was persisted");
         assert!(verify_password(password, hash));
+        assert_eq!(restored.channels, default_channels());
+        assert_eq!(restored.next_channel_id, default_next_channel_id());
 
         std::fs::remove_dir_all(test_dir)?;
         Ok(())
@@ -898,7 +1220,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock is after the Unix epoch")
             .as_nanos();
-        let test_dir = std::env::temp_dir().join(format!("glefchat-tls-test-{nonce}"));
+        let test_dir = std::env::temp_dir().join(format!("oxide-tls-test-{nonce}"));
         let cert_path = test_dir.join("server-cert.pem");
         let key_path = test_dir.join("server-key.pem");
         let users_path = test_dir.join("server-users.json");
@@ -926,6 +1248,8 @@ mod tests {
             profiles: HashMap::new(),
             roles: HashMap::from([("alice".to_string(), UserRole::Member)]),
             banned_users: HashSet::new(),
+            channels: default_channels(),
+            next_channel_id: default_next_channel_id(),
             bootstrap_admins: HashSet::new(),
             store_path: Some(users_path.clone()),
         }));
@@ -959,6 +1283,7 @@ mod tests {
         send_message(
             &mut writer,
             &ClientMessage::SendMessage {
+                channel_id: DEFAULT_CHANNEL_ID.to_string(),
                 content: "spoof attempt".to_string(),
             },
         )
@@ -980,6 +1305,11 @@ mod tests {
             read_message(&mut reader).await?,
             ServerMessage::Authenticated { username, role, .. }
                 if username == "alice" && role == UserRole::Member
+        ));
+        assert!(matches!(
+            read_message(&mut reader).await?,
+            ServerMessage::Channels { channels }
+                if channels == default_channels()
         ));
         assert!(matches!(
             read_message(&mut reader).await?,
@@ -1048,13 +1378,14 @@ mod tests {
         send_message(
             &mut writer,
             &ClientMessage::SendMessage {
+                channel_id: DEFAULT_CHANNEL_ID.to_string(),
                 content: "authenticated message".to_string(),
             },
         )
         .await?;
         assert!(matches!(
             read_message(&mut reader).await?,
-            ServerMessage::ChatMessage { author, content }
+            ServerMessage::ChatMessage { author, content, .. }
                 if author == "alice" && content == "authenticated message"
         ));
 
@@ -1074,6 +1405,11 @@ mod tests {
         assert!(matches!(
             read_message(&mut bob_reader).await?,
             ServerMessage::Authenticated { username, .. } if username == "bob"
+        ));
+        assert!(matches!(
+            read_message(&mut bob_reader).await?,
+            ServerMessage::Channels { channels }
+                if channels == default_channels()
         ));
         assert!(matches!(
             read_message(&mut bob_reader).await?,

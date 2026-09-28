@@ -1701,26 +1701,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "glefchat"
-version = "0.1.0"
-dependencies = [
- "argon2",
- "base64",
- "chrono",
- "dirs",
- "rcgen",
- "rfd",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "slint",
- "slint-build",
- "tokio",
- "tokio-rustls",
-]
-
-[[package]]
 name = "glob"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3469,6 +3449,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "36820e9051aca1014ddc75770aab4d68bc1e9e632f0f5627c4086bc216fb583b"
 dependencies = [
  "ttf-parser",
+]
+
+[[package]]
+name = "oxide-rs"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "base64",
+ "chrono",
+ "dirs",
+ "rcgen",
+ "rfd",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "slint",
+ "slint-build",
+ "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]

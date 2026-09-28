@@ -1,13 +1,13 @@
 # AGENTS.md
 
 ## Project
-GlefChat is a desktop chat application written in Rust. The client UI uses Slint, and the authenticated server uses Tokio and TLS. Serde-backed JSON messages are defined in `src/protocol.rs` and used by both binaries. The Slint interface is in `ui/main-window.slint` and is compiled by `build.rs`.
+Oxide is a desktop chat application written in Rust. The client UI uses Slint, and the authenticated server uses Tokio and TLS. Serde-backed JSON messages are defined in `src/protocol.rs` and used by both binaries. The Slint interface is in `ui/main-window.slint` and is compiled by `build.rs`.
 
 ## Build and Run
 - Build all targets: `cargo check --all-targets`
 - Run tests: `cargo test --all-targets`
 - Check formatting: `cargo fmt --all -- --check`
-- Run the client: `cargo run --bin glefchat`
+- Run the client: `cargo run --bin oxide-rs`
 - Run the server: `cargo run --bin server`
 
 Run the server and client in separate terminals. On Windows, use the stable Rust MSVC toolchain and install the Visual Studio C++ Build Tools workload required by Slint. See `README.md` for TLS setup, server configuration, and platform-specific data paths.
