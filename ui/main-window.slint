@@ -14,10 +14,84 @@ export component MainWindow inherits Window {
     background: CatppuccinMocha.base;
     
     in-out property <[Message]> messages;
-    in-out property <string> nickname: "Me";
+    in-out property <string> username: "";
+    in-out property <bool> logged-in: false;
+    in-out property <string> auth-error: "";
     callback send-message(string);
+    callback login(string, string);
+    callback register(string, string);
+    callback log-out();
     
-    VerticalBox {
+    if !root.logged-in : Rectangle {
+        background: CatppuccinMocha.base;
+        
+        Rectangle {
+            width: 380px;
+            height: 320px;
+            background: CatppuccinMocha.surface0;
+            border-radius: 14px;
+            
+            VerticalBox {
+                padding: 28px;
+                spacing: 14px;
+                alignment: center;
+                
+                Text {
+                    text: "GlefChat";
+                    font-size: 26px;
+                    font-weight: 700;
+                    color: CatppuccinMocha.lavender;
+                    horizontal-alignment: center;
+                }
+                
+                Text {
+                    text: "Sign in or create a profile";
+                    font-size: 13px;
+                    color: CatppuccinMocha.subtext0;
+                    horizontal-alignment: center;
+                }
+                
+                username-input := LineEdit {
+                    placeholder-text: "Username";
+                }
+                
+                password-input := LineEdit {
+                    placeholder-text: "Password";
+                    input-type: password;
+                    accepted(text) => {
+                        root.login(username-input.text, text);
+                    }
+                }
+                
+                if root.auth-error != "" : Text {
+                    text: root.auth-error;
+                    font-size: 12px;
+                    color: CatppuccinMocha.red;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+                
+                HorizontalBox {
+                    Button {
+                        text: "Log In";
+                        primary: true;
+                        clicked => {
+                            root.login(username-input.text, password-input.text);
+                        }
+                    }
+                    
+                    Button {
+                        text: "Register";
+                        clicked => {
+                            root.register(username-input.text, password-input.text);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    if root.logged-in : VerticalBox {
         padding: 20px;
         spacing: 16px;
         
@@ -41,16 +115,17 @@ export component MainWindow inherits Window {
                 Rectangle { }
                 
                 Text {
-                    text: "Nickname:";
+                    text: "Signed in as " + root.username;
                     font-size: 14px;
                     color: CatppuccinMocha.subtext0;
                     vertical-alignment: center;
                 }
                 
-                LineEdit {
-                    width: 180px;
-                    text <=> root.nickname;
-                    placeholder-text: "Enter nickname";
+                Button {
+                    text: "Log Out";
+                    clicked => {
+                        root.log-out();
+                    }
                 }
             }
         }
@@ -82,11 +157,11 @@ export component MainWindow inherits Window {
                             
                             for message[index] in root.messages : HorizontalBox {
                                 padding: 0px;
-                                alignment: message.author == root.nickname ? end : start;
+                                alignment: message.author == root.username ? end : start;
                                 
                                 Rectangle {
                                     max-width: 700px;
-                                    background: message.author == root.nickname ? CatppuccinMocha.mauve : CatppuccinMocha.surface1;
+                                    background: message.author == root.username ? CatppuccinMocha.mauve : CatppuccinMocha.surface1;
                                     border-radius: 14px;
                                     
                                     VerticalBox {
@@ -97,21 +172,21 @@ export component MainWindow inherits Window {
                                             text: message.author;
                                             font-size: 12px;
                                             font-weight: 700;
-                                            color: message.author == root.nickname ? CatppuccinMocha.crust : CatppuccinMocha.lavender;
+                                            color: message.author == root.username ? CatppuccinMocha.crust : CatppuccinMocha.lavender;
                                         }
                                         
                                         Text {
                                             text: message.content;
                                             font-size: 16px;
                                             wrap: word-wrap;
-                                            color: message.author == root.nickname ? CatppuccinMocha.crust : CatppuccinMocha.text;
+                                            color: message.author == root.username ? CatppuccinMocha.crust : CatppuccinMocha.text;
                                         }
                                         
                                         Text {
                                             text: message.timestamp;
                                             font-size: 11px;
                                             horizontal-alignment: right;
-                                            color: message.author == root.nickname ? CatppuccinMocha.crust : CatppuccinMocha.subtext0;
+                                            color: message.author == root.username ? CatppuccinMocha.crust : CatppuccinMocha.subtext0;
                                         }
                                     }
                                 }
