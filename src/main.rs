@@ -6,8 +6,8 @@ use rustls::{ClientConfig, RootCertStore};
 use serde::{Deserialize, Serialize};
 use slint::{Color, Model, ModelRc, VecModel, Weak};
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{self, BufReader as StdBufReader};
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufReader as StdBufReader, Write};
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -44,6 +44,14 @@ struct UserStore {
     themes: HashMap<String, HashMap<String, String>>,
     #[serde(default)]
     profiles: HashMap<String, UserProfile>,
+    #[serde(default)]
+    session: Option<SavedSession>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SavedSession {
+    username: String,
+    token: String,
 }
 
 const MAX_STORED_MESSAGES: usize = 500;
@@ -245,8 +253,28 @@ fn save_user_store(store: &UserStore) -> std::io::Result<()> {
     let path = users_file_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
     }
-    std::fs::write(path, serde_json::to_string_pretty(store)?)
+    let contents = serde_json::to_vec_pretty(store)?;
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    file.write_all(&contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 fn messages_file_path() -> PathBuf {
@@ -339,6 +367,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let model_rc: ModelRc<Message> = ModelRc::new(VecModel::from(messages));
     main_window.set_messages(model_rc);
     main_window.set_selected_channel_id(protocol::DEFAULT_CHANNEL_ID.into());
+    main_window.set_restoring_session(user_store.lock().unwrap().session.is_some());
     main_window.set_theme_colors(ModelRc::new(VecModel::from(theme_colors(None))));
     main_window
         .set_editable_theme_colors(ModelRc::new(VecModel::from(editable_theme_colors(None))));
@@ -419,11 +448,18 @@ fn main() -> Result<(), slint::PlatformError> {
 
     {
         let window = main_window.as_weak();
+        let user_store = user_store.clone();
         let outgoing_tx = outgoing_tx.clone();
         main_window.on_log_out(move || {
             let Some(win) = window.upgrade() else { return };
             let _ = outgoing_tx.send(ClientMessage::Logout);
+            let mut store = user_store.lock().unwrap();
+            store.session = None;
+            if let Err(err) = save_user_store(&store) {
+                eprintln!("failed to clear saved session: {err}");
+            }
             win.set_logged_in(false);
+            win.set_restoring_session(false);
             win.set_username("".into());
             win.set_viewed_profile_open(false);
             win.set_theme_colors(ModelRc::new(VecModel::from(theme_colors(None))));
@@ -822,6 +858,27 @@ async fn connect_to_server(
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut lines = BufReader::new(read_half).lines();
     let mut requested_profiles = HashSet::new();
+    let saved_session = user_store.lock().unwrap().session.clone();
+    if let Some(session) = saved_session {
+        let request = ClientMessage::ResumeSession {
+            username: session.username,
+            session_token: session.token,
+        };
+        match serde_json::to_vec(&request) {
+            Ok(mut line) => {
+                line.push(b'\n');
+                if let Err(err) = write_half.write_all(&line).await {
+                    eprintln!("failed to resume saved session: {err}");
+                    set_connection_lost(&window);
+                    return;
+                }
+            }
+            Err(err) => {
+                eprintln!("failed to encode saved session request: {err}");
+                set_auth_error(&window, "Could not restore the saved session.");
+            }
+        }
+    }
     loop {
         tokio::select! {
             command = outgoing_rx.recv() => {
@@ -899,6 +956,7 @@ fn set_auth_error(window: &Weak<MainWindow>, message: &'static str) {
     let window = window.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(window) = window.upgrade() {
+            window.set_restoring_session(false);
             window.set_auth_error(message.into());
         }
     });
@@ -910,6 +968,7 @@ fn set_connection_lost(window: &Weak<MainWindow>) {
         if let Some(window) = window.upgrade() {
             let account_banned = window.get_auth_error().to_string().contains("banned");
             window.set_logged_in(false);
+            window.set_restoring_session(false);
             window.set_username("".into());
             window.set_viewed_profile_open(false);
             window.set_account_role(UserRole::Member.label().into());
@@ -1048,6 +1107,7 @@ fn apply_server_message(
                 picture,
                 banner,
                 role,
+                session_token,
             } => {
                 let profile = UserProfile {
                     username: username.clone(),
@@ -1058,6 +1118,10 @@ fn apply_server_message(
                 };
                 let mut store = user_store.lock().unwrap();
                 store.profiles.insert(username.clone(), profile.clone());
+                store.session = (!session_token.is_empty()).then(|| SavedSession {
+                    username: username.clone(),
+                    token: session_token,
+                });
                 let overrides = store.themes.get(&username);
                 window.set_theme_colors(ModelRc::new(VecModel::from(theme_colors(overrides))));
                 window.set_editable_theme_colors(ModelRc::new(VecModel::from(
@@ -1068,6 +1132,7 @@ fn apply_server_message(
                 window.set_profile_banner(profile_image(&profile.banner));
                 window.set_username(username.into());
                 window.set_auth_error("".into());
+                window.set_restoring_session(false);
                 window.set_profile_error("".into());
                 window.set_logged_in(true);
                 refresh_message_avatars(&window, &store.profiles);
@@ -1079,14 +1144,37 @@ fn apply_server_message(
             ServerMessage::AuthenticationFailed { message } => {
                 window.set_auth_error(message.into());
             }
+            ServerMessage::SessionExpired { message } => {
+                let mut store = user_store.lock().unwrap();
+                store.session = None;
+                if let Err(err) = save_user_store(&store) {
+                    eprintln!("failed to clear expired saved session: {err}");
+                }
+                window.set_restoring_session(false);
+                window.set_auth_error(message.into());
+            }
             ServerMessage::AccountBanned { message } => {
+                let mut store = user_store.lock().unwrap();
+                store.session = None;
+                if let Err(err) = save_user_store(&store) {
+                    eprintln!("failed to clear banned saved session: {err}");
+                }
                 window.set_logged_in(false);
+                window.set_restoring_session(false);
                 window.set_username("".into());
                 window.set_viewed_profile_open(false);
                 window.set_account_role(UserRole::Member.label().into());
                 window.set_auth_error(message.into());
             }
             ServerMessage::Error { message } => {
+                if window.get_restoring_session() {
+                    let mut store = user_store.lock().unwrap();
+                    store.session = None;
+                    if let Err(err) = save_user_store(&store) {
+                        eprintln!("failed to clear unsupported saved session: {err}");
+                    }
+                    window.set_restoring_session(false);
+                }
                 if window.get_viewed_profile_open() {
                     window.set_viewed_profile_loading(false);
                     window.set_privilege_error(message.clone().into());
@@ -1094,7 +1182,13 @@ fn apply_server_message(
                 window.set_auth_error(message.into());
             }
             ServerMessage::LoggedOut => {
+                let mut store = user_store.lock().unwrap();
+                store.session = None;
+                if let Err(err) = save_user_store(&store) {
+                    eprintln!("failed to clear saved session: {err}");
+                }
                 window.set_logged_in(false);
+                window.set_restoring_session(false);
                 window.set_username("".into());
                 window.set_viewed_profile_open(false);
                 window.set_profile_picture(slint::Image::default());

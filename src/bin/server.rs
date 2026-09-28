@@ -53,6 +53,8 @@ struct UserStore {
     #[serde(default)]
     banned_users: HashSet<String>,
     #[serde(default)]
+    session_tokens: HashMap<String, String>,
+    #[serde(default)]
     channels: Vec<Channel>,
     #[serde(default = "default_next_channel_id")]
     next_channel_id: u64,
@@ -355,6 +357,11 @@ fn verify_password(password: &str, hash: &str) -> bool {
     })
 }
 
+fn new_session_token() -> io::Result<String> {
+    let key = rcgen::KeyPair::generate().map_err(io::Error::other)?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.serialize_der()))
+}
+
 async fn read_request_line(
     reader: &mut (impl AsyncBufRead + Unpin),
 ) -> io::Result<Option<Vec<u8>>> {
@@ -438,6 +445,7 @@ async fn handle_connection(
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = AsyncBufReader::new(reader);
     let mut authenticated_user: Option<String> = None;
+    let mut authenticated_session_hash: Option<String> = None;
     let mut presence = OnlinePresence::new(tx.clone());
 
     loop {
@@ -493,6 +501,12 @@ async fn handle_connection(
                                 .await
                                 .map_err(io::Error::other)?
                                 .map_err(io::Error::other)?;
+                            let session_token = new_session_token()?;
+                            let session_token_for_hash = session_token.clone();
+                            let session_hash = tokio::task::spawn_blocking(move || hash_password(&session_token_for_hash))
+                                .await
+                                .map_err(io::Error::other)?
+                                .map_err(io::Error::other)?;
                             let mut store = users.lock().await;
                             if store.users.contains_key(&username) {
                                 send_response(&mut writer, ServerMessage::AuthenticationFailed {
@@ -506,12 +520,19 @@ async fn handle_connection(
                                     UserRole::Member
                                 };
                                 store.roles.insert(username.clone(), role);
+                                let previous_session = store.session_tokens.insert(username.clone(), session_hash.clone());
                                 if let Err(err) = store.save() {
                                     store.users.remove(&username);
                                     store.roles.remove(&username);
+                                    if let Some(previous_session) = previous_session {
+                                        store.session_tokens.insert(username.clone(), previous_session);
+                                    } else {
+                                        store.session_tokens.remove(&username);
+                                    }
                                     return Err(err);
                                 }
                                 authenticated_user = Some(username.clone());
+                                authenticated_session_hash = Some(session_hash);
                                 presence.joined(username.clone());
                                 let profile = user_profile(&store, &username);
                                 send_response(&mut writer, ServerMessage::Authenticated {
@@ -519,6 +540,7 @@ async fn handle_connection(
                                     picture: profile.picture,
                                     banner: profile.banner,
                                     role: profile.role,
+                                    session_token,
                                 }).await?;
                                 send_response(&mut writer, ServerMessage::Channels {
                                     channels: store.channels.clone(),
@@ -548,14 +570,30 @@ async fn handle_connection(
                         .await
                         .map_err(io::Error::other)?;
                         if valid {
-                            let store = users.lock().await;
+                            let session_token = new_session_token()?;
+                            let session_token_for_hash = session_token.clone();
+                            let session_hash = tokio::task::spawn_blocking(move || hash_password(&session_token_for_hash))
+                                .await
+                                .map_err(io::Error::other)?
+                                .map_err(io::Error::other)?;
+                            let mut store = users.lock().await;
                             if store.banned_users.contains(&username) {
                                 send_response(&mut writer, ServerMessage::AccountBanned {
                                     message: "This account is banned.".to_string(),
                                 }).await?;
                                 continue;
                             }
+                            let previous_session = store.session_tokens.insert(username.clone(), session_hash.clone());
+                            if let Err(err) = store.save() {
+                                if let Some(previous_session) = previous_session {
+                                    store.session_tokens.insert(username.clone(), previous_session);
+                                } else {
+                                    store.session_tokens.remove(&username);
+                                }
+                                return Err(err);
+                            }
                             authenticated_user = Some(username.clone());
+                            authenticated_session_hash = Some(session_hash);
                             presence.joined(username.clone());
                             let profile = user_profile(&store, &username);
                             send_response(&mut writer, ServerMessage::Authenticated {
@@ -563,6 +601,7 @@ async fn handle_connection(
                                 picture: profile.picture,
                                 banner: profile.banner,
                                 role: profile.role,
+                                session_token,
                             }).await?;
                             send_response(&mut writer, ServerMessage::Channels {
                                 channels: store.channels.clone(),
@@ -574,9 +613,77 @@ async fn handle_connection(
                             }).await?;
                         }
                     }
+                    ClientMessage::ResumeSession { username, session_token } => {
+                        if authenticated_user.is_some() {
+                            send_response(&mut writer, ServerMessage::Error {
+                                message: "Log out before changing accounts.".to_string(),
+                            }).await?;
+                            continue;
+                        }
+                        if session_token.is_empty() || session_token.len() > 512 {
+                            send_response(&mut writer, ServerMessage::SessionExpired {
+                                message: "Your saved session has expired. Please sign in again.".to_string(),
+                            }).await?;
+                            continue;
+                        }
+                        let saved_hash = users.lock().await.session_tokens.get(&username).cloned();
+                        let verified_hash = saved_hash.clone();
+                        let token_to_verify = session_token.clone();
+                        let valid = tokio::task::spawn_blocking(move || {
+                            verified_hash.as_deref().is_some_and(|hash| verify_password(&token_to_verify, hash))
+                        })
+                        .await
+                        .map_err(io::Error::other)?;
+                        if !valid {
+                            send_response(&mut writer, ServerMessage::SessionExpired {
+                                message: "Your saved session has expired. Please sign in again.".to_string(),
+                            }).await?;
+                            continue;
+                        }
+                        let store = users.lock().await;
+                        if store.banned_users.contains(&username) {
+                            send_response(&mut writer, ServerMessage::AccountBanned {
+                                message: "This account is banned.".to_string(),
+                            }).await?;
+                            continue;
+                        }
+                        let Some(session_hash) = saved_hash.filter(|hash| {
+                            store.session_tokens.get(&username) == Some(hash)
+                        }) else {
+                            send_response(&mut writer, ServerMessage::SessionExpired {
+                                message: "Your saved session has expired. Please sign in again.".to_string(),
+                            }).await?;
+                            continue;
+                        };
+                        authenticated_user = Some(username.clone());
+                        authenticated_session_hash = Some(session_hash);
+                        presence.joined(username.clone());
+                        let profile = user_profile(&store, &username);
+                        send_response(&mut writer, ServerMessage::Authenticated {
+                            username,
+                            picture: profile.picture,
+                            banner: profile.banner,
+                            role: profile.role,
+                            session_token,
+                        }).await?;
+                        send_response(&mut writer, ServerMessage::Channels {
+                            channels: store.channels.clone(),
+                        }).await?;
+                    }
                     ClientMessage::Logout => {
                         presence.left();
+                        if let (Some(username), Some(session_hash)) = (
+                            authenticated_user.as_ref(),
+                            authenticated_session_hash.as_ref(),
+                        ) {
+                            let mut store = users.lock().await;
+                            if store.session_tokens.get(username) == Some(session_hash) {
+                                store.session_tokens.remove(username);
+                                store.save()?;
+                            }
+                        }
                         authenticated_user = None;
+                        authenticated_session_hash = None;
                         send_response(&mut writer, ServerMessage::LoggedOut).await?;
                     }
                     ClientMessage::SendMessage { channel_id, content } => {
@@ -942,18 +1049,14 @@ mod tests {
     }
 
     impl TestServer {
-        async fn start(
-            test_dir: &Path,
-            roles: HashMap<String, UserRole>,
-        ) -> io::Result<Self> {
+        async fn start(test_dir: &Path, roles: HashMap<String, UserRole>) -> io::Result<Self> {
             let cert_path = test_dir.join("server-cert.pem");
             let key_path = test_dir.join("server-key.pem");
             let users_path = test_dir.join("server-users.json");
             let acceptor = tls_acceptor_with_paths(&cert_path, &key_path)?;
 
-            let certificates =
-                rustls_pemfile::certs(&mut BufReader::new(File::open(&cert_path)?))
-                    .collect::<Result<Vec<_>, _>>()?;
+            let certificates = rustls_pemfile::certs(&mut BufReader::new(File::open(&cert_path)?))
+                .collect::<Result<Vec<_>, _>>()?;
             let mut roots = RootCertStore::empty();
             for certificate in certificates {
                 roots.add(certificate).map_err(io::Error::other)?;
@@ -979,6 +1082,7 @@ mod tests {
                 profiles: HashMap::new(),
                 roles,
                 banned_users: HashSet::new(),
+                session_tokens: HashMap::new(),
                 channels: default_channels(),
                 next_channel_id: default_next_channel_id(),
                 bootstrap_admins: HashSet::new(),
@@ -1248,6 +1352,7 @@ mod tests {
             profiles: HashMap::new(),
             roles: HashMap::from([("alice".to_string(), UserRole::Member)]),
             banned_users: HashSet::new(),
+            session_tokens: HashMap::new(),
             channels: default_channels(),
             next_channel_id: default_next_channel_id(),
             bootstrap_admins: HashSet::new(),

@@ -75,6 +75,10 @@ pub enum ClientMessage {
         username: String,
         password: String,
     },
+    ResumeSession {
+        username: String,
+        session_token: String,
+    },
     Logout,
     SendMessage {
         #[serde(default = "default_channel_id")]
@@ -126,6 +130,11 @@ pub enum ServerMessage {
         picture: Option<String>,
         banner: Option<String>,
         role: UserRole,
+        #[serde(default)]
+        session_token: String,
+    },
+    SessionExpired {
+        message: String,
     },
     AuthenticationFailed {
         message: String,
