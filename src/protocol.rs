@@ -2,6 +2,53 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_PROFILE_IMAGE_SIZE: usize = 512 * 1024;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserRole {
+    #[default]
+    Member,
+    Moderator,
+    Admin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum Permission {
+    BanUsers,
+    ManageRoles,
+    ManageChannels,
+    ManageServerInfo,
+}
+
+impl UserRole {
+    #[allow(dead_code)]
+    pub fn has_permission(self, permission: Permission) -> bool {
+        match self {
+            Self::Member => false,
+            Self::Moderator => permission == Permission::BanUsers,
+            Self::Admin => true,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Member => "Member",
+            Self::Moderator => "Moderator",
+            Self::Admin => "Admin",
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn level(self) -> u8 {
+        match self {
+            Self::Member => 0,
+            Self::Moderator => 1,
+            Self::Admin => 2,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
@@ -24,6 +71,14 @@ pub enum ClientMessage {
         picture: Option<String>,
         banner: Option<String>,
     },
+    SetUserRole {
+        username: String,
+        role: UserRole,
+    },
+    SetUserBanned {
+        username: String,
+        banned: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +86,10 @@ pub struct UserProfile {
     pub username: String,
     pub picture: Option<String>,
     pub banner: Option<String>,
+    #[serde(default)]
+    pub role: UserRole,
+    #[serde(default)]
+    pub banned: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -40,8 +99,12 @@ pub enum ServerMessage {
         username: String,
         picture: Option<String>,
         banner: Option<String>,
+        role: UserRole,
     },
     AuthenticationFailed {
+        message: String,
+    },
+    AccountBanned {
         message: String,
     },
     LoggedOut,

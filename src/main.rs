@@ -1,6 +1,6 @@
 use base64::Engine;
 use protocol::{ClientMessage, ServerMessage};
-use protocol::{MAX_PROFILE_IMAGE_SIZE, UserProfile};
+use protocol::{MAX_PROFILE_IMAGE_SIZE, UserProfile, UserRole};
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,14 @@ use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
 
 mod protocol;
+fn user_role_from_label(label: &str) -> Option<UserRole> {
+    match label {
+        "Member" => Some(UserRole::Member),
+        "Moderator" => Some(UserRole::Moderator),
+        "Admin" => Some(UserRole::Admin),
+        _ => None,
+    }
+}
 
 slint::include_modules!();
 
@@ -410,6 +418,7 @@ fn main() -> Result<(), slint::PlatformError> {
             let _ = outgoing_tx.send(ClientMessage::Logout);
             win.set_logged_in(false);
             win.set_username("".into());
+            win.set_viewed_profile_open(false);
             win.set_theme_colors(ModelRc::new(VecModel::from(theme_colors(None))));
             win.set_editable_theme_colors(ModelRc::new(VecModel::from(editable_theme_colors(
                 None,
@@ -485,6 +494,67 @@ fn main() -> Result<(), slint::PlatformError> {
                 outgoing_tx.clone(),
                 false,
             );
+        });
+    }
+
+    {
+        let window = main_window.as_weak();
+        let user_store = user_store.clone();
+        let outgoing_tx = outgoing_tx.clone();
+        main_window.on_show_user_profile(move |username| {
+            let Some(window) = window.upgrade() else {
+                return;
+            };
+            let username = username.to_string();
+            if username == window.get_username().as_str() {
+                return;
+            }
+
+            window.set_viewed_profile_username(username.clone().into());
+            window.set_viewed_profile_open(true);
+            window.set_viewed_profile_loading(true);
+            window.set_privilege_error("".into());
+            let cached_profile = user_store.lock().unwrap().profiles.get(&username).cloned();
+            if let Some(profile) = cached_profile {
+                window.set_viewed_profile_picture(profile_image(&profile.picture));
+                window.set_viewed_profile_banner(profile_image(&profile.banner));
+                window.set_viewed_profile_role(profile.role.label().into());
+                window.set_viewed_profile_banned(profile.banned);
+            } else {
+                window.set_viewed_profile_picture(slint::Image::default());
+                window.set_viewed_profile_banner(slint::Image::default());
+                window.set_viewed_profile_role(UserRole::Member.label().into());
+                window.set_viewed_profile_banned(false);
+            }
+            if outgoing_tx
+                .send(ClientMessage::GetProfile { username })
+                .is_err()
+            {
+                window.set_viewed_profile_loading(false);
+            }
+        });
+    }
+
+    {
+        let outgoing_tx = outgoing_tx.clone();
+        main_window.on_set_user_role(move |username, role_label| {
+            let Some(role) = user_role_from_label(role_label.as_str()) else {
+                return;
+            };
+            let _ = outgoing_tx.send(ClientMessage::SetUserRole {
+                username: username.to_string(),
+                role,
+            });
+        });
+    }
+
+    {
+        let outgoing_tx = outgoing_tx.clone();
+        main_window.on_set_user_banned(move |username, banned| {
+            let _ = outgoing_tx.send(ClientMessage::SetUserBanned {
+                username: username.to_string(),
+                banned,
+            });
         });
     }
 
@@ -615,6 +685,8 @@ fn launch_profile_image_picker(
                     username,
                     picture: None,
                     banner: None,
+                    role: UserRole::Member,
+                    banned: false,
                 });
             if is_banner {
                 profile.banner = Some(encoded.clone());
@@ -783,8 +855,11 @@ fn set_connection_lost(window: &Weak<MainWindow>) {
     let window = window.clone();
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(window) = window.upgrade() {
+            let account_banned = window.get_auth_error().to_string().contains("banned");
             window.set_logged_in(false);
             window.set_username("".into());
+            window.set_viewed_profile_open(false);
+            window.set_account_role(UserRole::Member.label().into());
             window.set_theme_colors(ModelRc::new(VecModel::from(theme_colors(None))));
             window.set_editable_theme_colors(ModelRc::new(VecModel::from(editable_theme_colors(
                 None,
@@ -792,7 +867,9 @@ fn set_connection_lost(window: &Weak<MainWindow>) {
             window.set_accent_name(ACCENT_OPTIONS[0].0.into());
             window.set_profile_picture(slint::Image::default());
             window.set_profile_banner(slint::Image::default());
-            window.set_auth_error("Connection to the chat server was lost.".into());
+            if !account_banned {
+                window.set_auth_error("Connection to the chat server was lost.".into());
+            }
         }
     });
 }
@@ -832,11 +909,14 @@ fn apply_server_message(
                 username,
                 picture,
                 banner,
+                role,
             } => {
                 let profile = UserProfile {
                     username: username.clone(),
                     picture,
                     banner,
+                    role,
+                    banned: false,
                 };
                 let mut store = user_store.lock().unwrap();
                 store.profiles.insert(username.clone(), profile.clone());
@@ -853,22 +933,39 @@ fn apply_server_message(
                 window.set_profile_error("".into());
                 window.set_logged_in(true);
                 refresh_message_avatars(&window, &store.profiles);
+                window.set_account_role(profile.role.label().into());
                 if let Err(err) = save_user_store(&store) {
                     eprintln!("failed to cache user profile: {err}");
                 }
             }
-            ServerMessage::AuthenticationFailed { message } | ServerMessage::Error { message } => {
+            ServerMessage::AuthenticationFailed { message } => {
+                window.set_auth_error(message.into());
+            }
+            ServerMessage::AccountBanned { message } => {
+                window.set_logged_in(false);
+                window.set_username("".into());
+                window.set_viewed_profile_open(false);
+                window.set_account_role(UserRole::Member.label().into());
+                window.set_auth_error(message.into());
+            }
+            ServerMessage::Error { message } => {
+                if window.get_viewed_profile_open() {
+                    window.set_viewed_profile_loading(false);
+                    window.set_privilege_error(message.clone().into());
+                }
                 window.set_auth_error(message.into());
             }
             ServerMessage::LoggedOut => {
                 window.set_logged_in(false);
                 window.set_username("".into());
+                window.set_viewed_profile_open(false);
                 window.set_profile_picture(slint::Image::default());
                 window.set_profile_banner(slint::Image::default());
                 window.set_theme_colors(ModelRc::new(VecModel::from(theme_colors(None))));
                 window.set_editable_theme_colors(ModelRc::new(VecModel::from(
                     editable_theme_colors(None),
                 )));
+                window.set_account_role(UserRole::Member.label().into());
                 window.set_accent_name(ACCENT_OPTIONS[0].0.into());
             }
             ServerMessage::Profile(profile) | ServerMessage::ProfileUpdated(profile) => {
@@ -880,6 +977,15 @@ fn apply_server_message(
                 if profile.username == window.get_username().as_str() {
                     window.set_profile_picture(profile_image(&profile.picture));
                     window.set_profile_banner(profile_image(&profile.banner));
+                    window.set_account_role(profile.role.label().into());
+                }
+                if window.get_viewed_profile_open()
+                    && profile.username == window.get_viewed_profile_username().as_str()
+                {
+                    window.set_viewed_profile_picture(profile_image(&profile.picture));
+                    window.set_viewed_profile_role(profile.role.label().into());
+                    window.set_viewed_profile_banned(profile.banned);
+                    window.set_viewed_profile_loading(false);
                 }
                 if let Err(err) = save_user_store(&store) {
                     eprintln!("failed to cache user profile: {err}");

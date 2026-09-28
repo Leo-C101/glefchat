@@ -1,11 +1,13 @@
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash};
 use base64::Engine;
-use protocol::{ClientMessage, MAX_PROFILE_IMAGE_SIZE, ServerMessage, UserProfile};
+use protocol::{
+    ClientMessage, MAX_PROFILE_IMAGE_SIZE, Permission, ServerMessage, UserProfile, UserRole,
+};
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader};
 use std::net::SocketAddr;
@@ -30,6 +32,12 @@ struct UserStore {
     users: HashMap<String, String>,
     #[serde(default)]
     profiles: HashMap<String, UserProfile>,
+    #[serde(default)]
+    roles: HashMap<String, UserRole>,
+    #[serde(default)]
+    banned_users: HashSet<String>,
+    #[serde(skip)]
+    bootstrap_admins: HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -47,7 +55,7 @@ fn valid_profile_image(image: &Option<String>) -> bool {
 }
 
 fn user_profile(store: &UserStore, username: &str) -> UserProfile {
-    store
+    let mut profile = store
         .profiles
         .get(username)
         .cloned()
@@ -55,17 +63,73 @@ fn user_profile(store: &UserStore, username: &str) -> UserProfile {
             username: username.to_string(),
             picture: None,
             banner: None,
-        })
+            role: UserRole::Member,
+            banned: false,
+        });
+    profile.role = store.roles.get(username).copied().unwrap_or_default();
+    profile.banned = store.banned_users.contains(username);
+    profile
+}
+
+fn parse_admin_usernames(value: &str) -> HashSet<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|username| valid_username(username))
+        .map(str::to_string)
+        .collect()
+}
+
+fn configured_admin_usernames() -> HashSet<String> {
+    std::env::var("CHAT_ADMIN_USERNAMES")
+        .map(|value| parse_admin_usernames(&value))
+        .unwrap_or_default()
+}
+
+fn can_moderate_user(actor: UserRole, target: UserRole) -> bool {
+    actor.has_permission(Permission::BanUsers) && target.level() < actor.level()
+}
+
+fn role_change_error(
+    actor: &str,
+    actor_role: UserRole,
+    target: &str,
+    target_role: UserRole,
+    new_role: UserRole,
+    admin_count: usize,
+) -> Option<&'static str> {
+    if !actor_role.has_permission(Permission::ManageRoles) {
+        Some("Only administrators can change roles.")
+    } else if actor == target {
+        Some("You cannot change your own role.")
+    } else if target_role == UserRole::Admin && new_role != UserRole::Admin && admin_count <= 1 {
+        Some("The last administrator cannot be demoted.")
+    } else {
+        None
+    }
 }
 
 impl UserStore {
     fn load() -> io::Result<Self> {
         let path = users_file_path()?;
-        match fs::read_to_string(path) {
-            Ok(contents) => serde_json::from_str(&contents).map_err(io::Error::other),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(err) => Err(err),
+        let mut store = match fs::read_to_string(path) {
+            Ok(contents) => serde_json::from_str(&contents).map_err(io::Error::other)?,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Self::default(),
+            Err(err) => return Err(err),
+        };
+        store.bootstrap_admins = configured_admin_usernames();
+        let mut changed = false;
+        for username in store.bootstrap_admins.clone() {
+            if store.users.contains_key(&username)
+                && store.roles.insert(username, UserRole::Admin) != Some(UserRole::Admin)
+            {
+                changed = true;
+            }
         }
+        if changed {
+            store.save()?;
+        }
+        Ok(store)
     }
 
     fn save(&self) -> io::Result<()> {
@@ -340,8 +404,15 @@ async fn handle_connection(
                                 }).await?;
                             } else {
                                 store.users.insert(username.clone(), hash);
+                                let role = if store.bootstrap_admins.contains(&username) {
+                                    UserRole::Admin
+                                } else {
+                                    UserRole::Member
+                                };
+                                store.roles.insert(username.clone(), role);
                                 if let Err(err) = store.save() {
                                     store.users.remove(&username);
+                                    store.roles.remove(&username);
                                     return Err(err);
                                 }
                                 authenticated_user = Some(username.clone());
@@ -350,6 +421,7 @@ async fn handle_connection(
                                     username,
                                     picture: profile.picture,
                                     banner: profile.banner,
+                                    role: profile.role,
                                 }).await?;
                             }
                         }
@@ -376,13 +448,20 @@ async fn handle_connection(
                         .await
                         .map_err(io::Error::other)?;
                         if valid {
-                            authenticated_user = Some(username.clone());
                             let store = users.lock().await;
+                            if store.banned_users.contains(&username) {
+                                send_response(&mut writer, ServerMessage::AccountBanned {
+                                    message: "This account is banned.".to_string(),
+                                }).await?;
+                                continue;
+                            }
+                            authenticated_user = Some(username.clone());
                             let profile = user_profile(&store, &username);
                             send_response(&mut writer, ServerMessage::Authenticated {
                                 username,
                                 picture: profile.picture,
                                 banner: profile.banner,
+                                role: profile.role,
                             }).await?;
                         } else {
                             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -436,12 +515,10 @@ async fn handle_connection(
                             }).await?;
                             continue;
                         }
-                        let profile = UserProfile {
-                            username: username.clone(),
-                            picture,
-                            banner,
-                        };
                         let mut store = users.lock().await;
+                        let mut profile = user_profile(&store, username);
+                        profile.picture = picture;
+                        profile.banner = banner;
                         let previous = store.profiles.insert(username.clone(), profile.clone());
                         if let Err(err) = store.save() {
                             if let Some(previous) = previous {
@@ -451,6 +528,91 @@ async fn handle_connection(
                             }
                             return Err(err);
                         }
+                        drop(store);
+                        let _ = tx.send(Broadcast::ProfileUpdated(profile));
+                    }
+                    ClientMessage::SetUserRole { username, role } => {
+                        let Some(actor) = authenticated_user.as_ref() else {
+                            send_response(&mut writer, ServerMessage::AuthenticationFailed {
+                                message: "Sign in before managing roles.".to_string(),
+                            }).await?;
+                            continue;
+                        };
+                        let mut store = users.lock().await;
+                        let actor_role = store.roles.get(actor).copied().unwrap_or_default();
+                        let previous = store.roles.get(&username).copied().unwrap_or_default();
+                        let admin_count = store.roles.values().filter(|role| **role == UserRole::Admin).count();
+                        if let Some(message) = role_change_error(
+                            actor,
+                            actor_role,
+                            &username,
+                            previous,
+                            role,
+                            admin_count,
+                        ) {
+                            send_response(&mut writer, ServerMessage::Error {
+                                message: message.to_string(),
+                            }).await?;
+                            continue;
+                        }
+                        if !store.users.contains_key(&username) {
+                            send_response(&mut writer, ServerMessage::Error {
+                                message: "That user does not exist.".to_string(),
+                            }).await?;
+                            continue;
+                        }
+                        store.roles.insert(username.clone(), role);
+                        if let Err(err) = store.save() {
+                            store.roles.insert(username.clone(), previous);
+                            return Err(err);
+                        }
+                        let profile = user_profile(&store, &username);
+                        drop(store);
+                        let _ = tx.send(Broadcast::ProfileUpdated(profile));
+                    }
+                    ClientMessage::SetUserBanned { username, banned } => {
+                        let Some(actor) = authenticated_user.as_ref() else {
+                            send_response(&mut writer, ServerMessage::AuthenticationFailed {
+                                message: "Sign in before moderating users.".to_string(),
+                            }).await?;
+                            continue;
+                        };
+                        let mut store = users.lock().await;
+                        let actor_role = store.roles.get(actor).copied().unwrap_or_default();
+                        let target_role = store.roles.get(&username).copied().unwrap_or_default();
+                        if !actor_role.has_permission(Permission::BanUsers) {
+                            send_response(&mut writer, ServerMessage::Error {
+                                message: "You do not have permission to ban users.".to_string(),
+                            }).await?;
+                            continue;
+                        }
+                        if actor == &username || !can_moderate_user(actor_role, target_role) {
+                            send_response(&mut writer, ServerMessage::Error {
+                                message: "You cannot moderate this account.".to_string(),
+                            }).await?;
+                            continue;
+                        }
+                        if !store.users.contains_key(&username) {
+                            send_response(&mut writer, ServerMessage::Error {
+                                message: "That user does not exist.".to_string(),
+                            }).await?;
+                            continue;
+                        }
+                        let was_banned = store.banned_users.contains(&username);
+                        if banned {
+                            store.banned_users.insert(username.clone());
+                        } else {
+                            store.banned_users.remove(&username);
+                        }
+                        if let Err(err) = store.save() {
+                            if was_banned {
+                                store.banned_users.insert(username.clone());
+                            } else {
+                                store.banned_users.remove(&username);
+                            }
+                            return Err(err);
+                        }
+                        let profile = user_profile(&store, &username);
                         drop(store);
                         let _ = tx.send(Broadcast::ProfileUpdated(profile));
                     }
@@ -464,6 +626,14 @@ async fn handle_connection(
                         }
                     }
                     Ok(Broadcast::ProfileUpdated(profile)) => {
+                        if profile.banned
+                            && authenticated_user.as_deref() == Some(profile.username.as_str())
+                        {
+                            send_response(&mut writer, ServerMessage::AccountBanned {
+                                message: "Your account has been banned.".to_string(),
+                            }).await?;
+                            break;
+                        }
                         if authenticated_user.is_some() {
                             send_response(&mut writer, ServerMessage::ProfileUpdated(profile)).await?;
                         }
@@ -484,16 +654,17 @@ async fn handle_connection(
 #[cfg(test)]
 mod tests {
     use super::{
-        UserStore, handle_connection, hash_password, tls_acceptor_with_paths, valid_profile_image,
-        valid_username, verify_password,
+        UserStore, can_moderate_user, handle_connection, hash_password, parse_admin_usernames,
+        role_change_error, tls_acceptor_with_paths, valid_profile_image, valid_username,
+        verify_password,
     };
-    use crate::protocol::MAX_PROFILE_IMAGE_SIZE;
-    use crate::protocol::{ClientMessage, ServerMessage};
+    use crate::protocol::{ClientMessage, ServerMessage, UserProfile};
+    use crate::protocol::{MAX_PROFILE_IMAGE_SIZE, Permission, UserRole};
     use base64::Engine;
     use rustls::pki_types::ServerName;
     use rustls::{ClientConfig, RootCertStore};
     use serde::Serialize;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::fs::File;
     use std::io::{self, BufReader};
     use std::net::{IpAddr, Ipv4Addr};
@@ -526,6 +697,91 @@ mod tests {
         assert!(valid_username("alice_42"));
         assert!(!valid_username("al"));
         assert!(!valid_username("alice\t42"));
+    }
+
+    #[test]
+    fn roles_grant_only_their_configured_permissions() {
+        assert!(!UserRole::Member.has_permission(Permission::BanUsers));
+        assert!(UserRole::Moderator.has_permission(Permission::BanUsers));
+        assert!(!UserRole::Moderator.has_permission(Permission::ManageRoles));
+        assert!(UserRole::Admin.has_permission(Permission::ManageRoles));
+        assert!(UserRole::Admin.has_permission(Permission::ManageChannels));
+        assert!(UserRole::Admin.has_permission(Permission::ManageServerInfo));
+    }
+
+    #[test]
+    fn moderators_can_only_moderate_lower_roles() {
+        assert!(can_moderate_user(UserRole::Moderator, UserRole::Member));
+        assert!(!can_moderate_user(UserRole::Moderator, UserRole::Moderator));
+        assert!(!can_moderate_user(UserRole::Moderator, UserRole::Admin));
+        assert!(can_moderate_user(UserRole::Admin, UserRole::Moderator));
+        assert!(!can_moderate_user(UserRole::Admin, UserRole::Admin));
+        assert!(!can_moderate_user(UserRole::Member, UserRole::Member));
+    }
+
+    #[test]
+    fn role_changes_require_admin_and_protect_self_and_last_admin() {
+        assert_eq!(
+            role_change_error(
+                "alice",
+                UserRole::Moderator,
+                "bob",
+                UserRole::Member,
+                UserRole::Moderator,
+                1,
+            ),
+            Some("Only administrators can change roles.")
+        );
+        assert_eq!(
+            role_change_error(
+                "alice",
+                UserRole::Admin,
+                "alice",
+                UserRole::Admin,
+                UserRole::Member,
+                1,
+            ),
+            Some("You cannot change your own role.")
+        );
+        assert_eq!(
+            role_change_error(
+                "alice",
+                UserRole::Admin,
+                "bob",
+                UserRole::Admin,
+                UserRole::Member,
+                1,
+            ),
+            Some("The last administrator cannot be demoted.")
+        );
+        assert_eq!(
+            role_change_error(
+                "alice",
+                UserRole::Admin,
+                "bob",
+                UserRole::Admin,
+                UserRole::Moderator,
+                2,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn admin_bootstrap_list_is_trimmed_and_validated() {
+        let admins = parse_admin_usernames(" alice, invalid name, bob_2, al ");
+        assert_eq!(
+            admins,
+            HashSet::from(["alice".to_string(), "bob_2".to_string()])
+        );
+    }
+
+    #[test]
+    fn legacy_profiles_default_to_members() {
+        let profile: UserProfile =
+            serde_json::from_str(r#"{"username":"alice","picture":null,"banner":null}"#).unwrap();
+        assert_eq!(profile.role, UserRole::Member);
+        assert!(!profile.banned);
     }
 
     #[test]
@@ -582,6 +838,9 @@ mod tests {
                 hash_password("correct horse battery staple").unwrap(),
             )]),
             profiles: HashMap::new(),
+            roles: HashMap::new(),
+            banned_users: HashSet::new(),
+            bootstrap_admins: HashSet::new(),
         }));
         let server_tx = tx.clone();
         let server_users = users.clone();
@@ -626,7 +885,34 @@ mod tests {
         .await?;
         assert!(matches!(
             read_message(&mut reader).await?,
-            ServerMessage::Authenticated { username, .. } if username == "alice"
+            ServerMessage::Authenticated { username, role, .. }
+                if username == "alice" && role == UserRole::Member
+        ));
+
+        send_message(
+            &mut writer,
+            &ClientMessage::SetUserRole {
+                username: "alice".to_string(),
+                role: UserRole::Admin,
+            },
+        )
+        .await?;
+        assert!(matches!(
+            read_message(&mut reader).await?,
+            ServerMessage::Error { message } if message == "Only administrators can change roles."
+        ));
+
+        send_message(
+            &mut writer,
+            &ClientMessage::SetUserBanned {
+                username: "bob".to_string(),
+                banned: true,
+            },
+        )
+        .await?;
+        assert!(matches!(
+            read_message(&mut reader).await?,
+            ServerMessage::Error { message } if message == "You do not have permission to ban users."
         ));
 
         let picture = base64::engine::general_purpose::STANDARD.encode(b"avatar");

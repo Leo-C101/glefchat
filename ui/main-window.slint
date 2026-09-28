@@ -28,10 +28,19 @@ export component MainWindow inherits Window {
     in-out property <string> accent-name: "Lavender";
     in-out property <bool> theme-editor-open: false;
     in-out property <bool> profile-editor-open: false;
+    in-out property <bool> viewed-profile-open: false;
+    in-out property <bool> viewed-profile-loading: false;
+    in-out property <string> viewed-profile-username: "";
+    in-out property <string> account-role: "Member";
+    in-out property <string> viewed-profile-role: "Member";
+    in-out property <bool> viewed-profile-banned: false;
     in-out property <string> theme-error: "";
     in-out property <string> profile-error: "";
+    in-out property <string> privilege-error: "";
     in-out property <image> profile-picture;
     in-out property <image> profile-banner;
+    in-out property <image> viewed-profile-picture;
+    in-out property <image> viewed-profile-banner;
     callback send-message(string);
     callback login(string, string);
     callback register(string, string);
@@ -40,6 +49,9 @@ export component MainWindow inherits Window {
     callback set-theme-accent(string);
     callback choose-profile-picture();
     callback choose-profile-banner();
+    callback show-user-profile(string);
+    callback set-user-role(string, string);
+    callback set-user-banned(string, bool);
     
     if !root.logged-in : Rectangle {
         background: root.theme-colors[23].value;
@@ -134,7 +146,7 @@ export component MainWindow inherits Window {
                 Rectangle { }
                 
                 Text {
-                    text: "Signed in as " + root.username;
+                    text: "Signed in as " + root.username + " (" + root.account-role + ")";
                     font-size: 14px;
                     color: root.theme-colors[16].value;
                     vertical-alignment: center;
@@ -143,6 +155,7 @@ export component MainWindow inherits Window {
                 Button {
                     text: "Theme";
                     clicked => {
+                        root.viewed-profile-open = false;
                         root.profile-editor-open = false;
                         root.theme-editor-open = !root.theme-editor-open;
                         root.theme-error = "";
@@ -152,6 +165,7 @@ export component MainWindow inherits Window {
                 Button {
                     text: "Profile";
                     clicked => {
+                        root.viewed-profile-open = false;
                         root.theme-editor-open = false;
                         root.profile-editor-open = !root.profile-editor-open;
                         root.profile-error = "";
@@ -166,8 +180,106 @@ export component MainWindow inherits Window {
                 }
             }
         }
+
+        if root.viewed-profile-open : Rectangle {
+            height: root.account-role == "Admin" ? 190px : (root.account-role == "Moderator" ? 150px : 112px);
+            background: root.theme-colors[22].value;
+            border-radius: 10px;
+
+            HorizontalBox {
+                padding: 10px;
+                spacing: 12px;
+
+                Rectangle {
+                    width: 180px;
+                    height: 88px;
+                    background: root.theme-colors[21].value;
+                    border-radius: 8px;
+                    clip: true;
+
+                    Image {
+                        source: root.viewed-profile-banner;
+                        width: parent.width;
+                        height: parent.height;
+                        image-fit: cover;
+                    }
+                }
+
+                Rectangle {
+                    width: 64px;
+                    height: 64px;
+                    background: root.theme-colors[21].value;
+                    border-radius: 32px;
+                    clip: true;
+
+                    Image {
+                        source: root.viewed-profile-picture;
+                        width: parent.width;
+                        height: parent.height;
+                        image-fit: cover;
+                    }
+                }
+
+                VerticalBox {
+                    alignment: center;
+
+                    Text {
+                        text: root.viewed-profile-username;
+                        font-size: 18px;
+                        font-weight: 700;
+                        color: root.theme-colors[13].value;
+                    }
+
+                    Text {
+                        text: "Role: " + root.viewed-profile-role + (root.viewed-profile-banned ? " · Banned" : "");
+                        font-size: 12px;
+                        color: root.theme-colors[16].value;
+                    }
+
+                    if root.viewed-profile-loading : Text {
+                        text: "Loading profile...";
+                        font-size: 12px;
+                        color: root.theme-colors[16].value;
+                    }
+
+                    if root.account-role == "Admin" : ComboBox {
+                        model: ["Member", "Moderator", "Admin"];
+                        current-value: root.viewed-profile-role;
+                        selected(value) => {
+                            root.set-user-role(root.viewed-profile-username, value);
+                        }
+                    }
+
+                    if root.account-role == "Admin" && root.viewed-profile-role != "Admin" : Button {
+                        text: root.viewed-profile-banned ? "Unban" : "Ban";
+                        clicked => {
+                            root.set-user-banned(root.viewed-profile-username, !root.viewed-profile-banned);
+                        }
+                    }
+
+                    if root.account-role == "Moderator" && root.viewed-profile-role == "Member" : Button {
+                        text: root.viewed-profile-banned ? "Unban" : "Ban";
+                        clicked => {
+                            root.set-user-banned(root.viewed-profile-username, !root.viewed-profile-banned);
+                        }
+                    }
+
+                    if root.privilege-error != "" : Text {
+                        text: root.privilege-error;
+                        font-size: 11px;
+                        color: root.theme-colors[4].value;
+                        wrap: word-wrap;
+                    }
+                }
+
+                Button {
+                    text: "Back to chat";
+                    clicked => { root.viewed-profile-open = false; }
+                }
+            }
+        }
         
-        if root.theme-editor-open : Rectangle {
+        if !root.viewed-profile-open && root.theme-editor-open : Rectangle {
             background: root.theme-colors[22].value;
             border-radius: 10px;
 
@@ -257,7 +369,7 @@ export component MainWindow inherits Window {
             }
         }
 
-        if root.profile-editor-open : Rectangle {
+        if !root.viewed-profile-open && root.profile-editor-open : Rectangle {
             background: root.theme-colors[22].value;
             border-radius: 10px;
 
@@ -325,7 +437,14 @@ export component MainWindow inherits Window {
             }
         }
 
-        if !root.theme-editor-open && !root.profile-editor-open : Rectangle {
+        if !root.theme-editor-open && !root.profile-editor-open : chat-panel := Rectangle {
+            property <bool> follow-chat-bottom: true;
+            property <int> observed-message-count: root.messages.length;
+            changed observed-message-count => {
+                if (follow-chat-bottom) {
+                    chat-scroll.content-y = chat-scroll.content-height;
+                }
+            }
             background: root.theme-colors[22].value;
             border-radius: 10px;
 
@@ -337,7 +456,11 @@ export component MainWindow inherits Window {
                     background: root.theme-colors[24].value;
                     border-radius: 10px;
     
-                    ScrollView {
+                    chat-scroll := ScrollView {
+                        changed content-y => {
+                            chat-panel.follow-chat-bottom = chat-scroll.content-height - chat-scroll.visible-height - chat-scroll.content-y <= 80px;
+                        }
+
                         VerticalBox {
                             padding: 12px;
                             spacing: 10px;
@@ -367,6 +490,12 @@ export component MainWindow inherits Window {
                                         height: parent.height;
                                         image-fit: cover;
                                     }
+
+                                    TouchArea {
+                                        width: parent.width;
+                                        height: parent.height;
+                                        clicked => { root.show-user-profile(message.author); }
+                                    }
                                 }
                                 
                                 Rectangle {
@@ -378,11 +507,23 @@ export component MainWindow inherits Window {
                                         padding: 10px;
                                         spacing: 3px;
                                         
-                                        Text {
+                                        if message.author != root.username : TouchArea {
+                                            height: 16px;
+                                            clicked => { root.show-user-profile(message.author); }
+
+                                            Text {
+                                                text: message.author;
+                                                font-size: 12px;
+                                                font-weight: 700;
+                                                color: root.theme-colors[13].value;
+                                            }
+                                        }
+
+                                        if message.author == root.username : Text {
                                             text: message.author;
                                             font-size: 12px;
                                             font-weight: 700;
-                                            color: message.author == root.username ? root.theme-colors[25].value : root.theme-colors[13].value;
+                                            color: root.theme-colors[25].value;
                                         }
                                         
                                         Text {
