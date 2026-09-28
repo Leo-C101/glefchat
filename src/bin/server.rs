@@ -18,7 +18,7 @@ use tokio_rustls::TlsAcceptor;
 #[path = "../protocol.rs"]
 mod protocol;
 
-const MIN_PASSWORD_LENGTH: usize = 12;
+const MIN_PASSWORD_LENGTH: usize = 8;
 const MAX_PASSWORD_LENGTH: usize = 1024;
 const MAX_MESSAGE_LENGTH: usize = 4096;
 const MAX_REQUEST_LENGTH: usize = 16 * 1024;
@@ -296,7 +296,7 @@ async fn handle_connection(
                             }).await?;
                         } else if !(MIN_PASSWORD_LENGTH..=MAX_PASSWORD_LENGTH).contains(&password.len()) {
                             send_response(&mut writer, ServerMessage::AuthenticationFailed {
-                                message: "Password must be 12-1024 bytes long.".to_string(),
+                                message: "Password must be 8-1024 bytes long.".to_string(),
                             }).await?;
                         } else {
                             let password_to_hash = password.clone();

@@ -1703,6 +1703,7 @@ name = "glefchat"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "chrono",
  "dirs",
  "rcgen",
  "rustls",

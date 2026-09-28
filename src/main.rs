@@ -34,6 +34,25 @@ struct UserStore {
     themes: HashMap<String, HashMap<String, String>>,
 }
 
+const MAX_STORED_MESSAGES: usize = 500;
+
+#[derive(Clone, Serialize, Deserialize)]
+struct StoredMessage {
+    author: String,
+    content: String,
+    timestamp: String,
+}
+
+impl From<&StoredMessage> for Message {
+    fn from(stored: &StoredMessage) -> Self {
+        Message {
+            author: stored.author.clone().into(),
+            content: stored.content.clone().into(),
+            timestamp: stored.timestamp.clone().into(),
+        }
+    }
+}
+
 const DEFAULT_THEME: [(&str, &str); 26] = [
     ("rosewater", "#f5e0dc"),
     ("flamingo", "#f2cdcd"),
@@ -200,6 +219,26 @@ fn save_user_store(store: &UserStore) -> std::io::Result<()> {
     std::fs::write(path, serde_json::to_string_pretty(store)?)
 }
 
+fn messages_file_path() -> PathBuf {
+    let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+    base.join("glefchat").join("messages.json")
+}
+
+fn load_messages() -> Vec<StoredMessage> {
+    std::fs::read_to_string(messages_file_path())
+        .ok()
+        .and_then(|contents| serde_json::from_str(&contents).ok())
+        .unwrap_or_default()
+}
+
+fn save_messages(messages: &[StoredMessage]) -> std::io::Result<()> {
+    let path = messages_file_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_string_pretty(messages)?)
+}
+
 fn tls_certificate_path() -> PathBuf {
     std::env::var_os("CHAT_TLS_CERT")
         .map(PathBuf::from)
@@ -250,7 +289,13 @@ fn valid_username(username: &str) -> bool {
 fn main() -> Result<(), slint::PlatformError> {
     let main_window = MainWindow::new()?;
 
-    let messages = Vec::new();
+    let stored_messages = Arc::new(Mutex::new(load_messages()));
+    let messages: Vec<Message> = stored_messages
+        .lock()
+        .unwrap()
+        .iter()
+        .map(Message::from)
+        .collect();
 
     let model_rc: ModelRc<Message> = ModelRc::new(VecModel::from(messages));
     main_window.set_messages(model_rc);
@@ -273,6 +318,7 @@ fn main() -> Result<(), slint::PlatformError> {
         chat_address(),
         main_window.as_weak(),
         user_store.clone(),
+        stored_messages.clone(),
         outgoing_rx,
     ));
 
@@ -312,8 +358,8 @@ fn main() -> Result<(), slint::PlatformError> {
                 );
                 return;
             }
-            if !(12..=1024).contains(&password.len()) {
-                win.set_auth_error("Password must be 12-1024 bytes long.".into());
+            if !(8..=1024).contains(&password.len()) {
+                win.set_auth_error("Password must be 8-1024 bytes long.".into());
                 return;
             }
             if outgoing_tx
@@ -448,6 +494,7 @@ async fn connect_to_server(
     addr: String,
     window: Weak<MainWindow>,
     user_store: Arc<Mutex<UserStore>>,
+    stored_messages: Arc<Mutex<Vec<StoredMessage>>>,
     mut outgoing_rx: mpsc::UnboundedReceiver<ClientMessage>,
 ) {
     let stream = match TcpStream::connect(&addr).await {
@@ -506,7 +553,9 @@ async fn connect_to_server(
             result = lines.next_line() => {
                 match result {
                     Ok(Some(line)) => match serde_json::from_str::<ServerMessage>(&line) {
-                        Ok(message) => apply_server_message(&window, &user_store, message),
+                        Ok(message) => {
+                            apply_server_message(&window, &user_store, &stored_messages, message)
+                        }
                         Err(err) => eprintln!("ignored invalid server response: {err}"),
                     },
                     Ok(None) => break,
@@ -549,10 +598,12 @@ fn set_connection_lost(window: &Weak<MainWindow>) {
 fn apply_server_message(
     window: &Weak<MainWindow>,
     user_store: &Arc<Mutex<UserStore>>,
+    stored_messages: &Arc<Mutex<Vec<StoredMessage>>>,
     message: ServerMessage,
 ) {
     let window = window.clone();
     let user_store = user_store.clone();
+    let stored_messages = stored_messages.clone();
     let _ = slint::invoke_from_event_loop(move || {
         let Some(window) = window.upgrade() else {
             return;
@@ -583,13 +634,24 @@ fn apply_server_message(
                 window.set_accent_name(ACCENT_OPTIONS[0].0.into());
             }
             ServerMessage::ChatMessage { author, content } => {
+                let stored = StoredMessage {
+                    author: author.clone(),
+                    content: content.clone(),
+                    timestamp: current_timestamp(),
+                };
                 let model = window.get_messages();
                 if let Some(vec_model) = model.as_any().downcast_ref::<VecModel<Message>>() {
-                    vec_model.push(Message {
-                        content: content.into(),
-                        timestamp: current_timestamp().into(),
-                        author: author.into(),
-                    });
+                    vec_model.push(Message::from(&stored));
+                }
+
+                let mut messages = stored_messages.lock().unwrap();
+                messages.push(stored);
+                let overflow = messages.len().saturating_sub(MAX_STORED_MESSAGES);
+                if overflow > 0 {
+                    messages.drain(0..overflow);
+                }
+                if let Err(err) = save_messages(&messages) {
+                    eprintln!("failed to save chat history: {err}");
                 }
             }
         }
