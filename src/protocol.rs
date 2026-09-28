@@ -2,14 +2,39 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_PROFILE_IMAGE_SIZE: usize = 512 * 1024;
 pub const DEFAULT_CHANNEL_ID: &str = "1";
+pub const DEFAULT_CHAT_SERVER_ID: &str = "1";
 
 pub fn default_channel_id() -> String {
     DEFAULT_CHANNEL_ID.to_string()
 }
 
+pub fn default_chat_server_id() -> String {
+    DEFAULT_CHAT_SERVER_ID.to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct ChatServer {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub icon: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatServerView {
+    pub id: String,
+    pub name: String,
+    pub icon: Option<String>,
+    pub member_count: u32,
+    pub is_member: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Channel {
     pub id: String,
+    #[serde(default = "default_chat_server_id")]
+    pub server_id: String,
     pub name: String,
     pub topic: String,
 }
@@ -80,7 +105,23 @@ pub enum ClientMessage {
         session_token: String,
     },
     Logout,
+    CreateChatServer {
+        name: String,
+        #[serde(default)]
+        icon: Option<String>,
+    },
+    JoinChatServer {
+        server_id: String,
+    },
+    SelectChatServer {
+        server_id: String,
+    },
+    LeaveChatServer {
+        server_id: String,
+    },
     SendMessage {
+        #[serde(default = "default_chat_server_id")]
+        server_id: String,
         #[serde(default = "default_channel_id")]
         channel_id: String,
         content: String,
@@ -144,18 +185,30 @@ pub enum ServerMessage {
     },
     LoggedOut,
     ChatMessage {
+        #[serde(default = "default_chat_server_id")]
+        server_id: String,
         #[serde(default = "default_channel_id")]
         channel_id: String,
         author: String,
         content: String,
     },
     Channels {
+        #[serde(default = "default_chat_server_id")]
+        server_id: String,
         channels: Vec<Channel>,
     },
+    ChatServers {
+        servers: Vec<ChatServerView>,
+        active_server_id: String,
+    },
     UserJoined {
+        #[serde(default = "default_chat_server_id")]
+        server_id: String,
         username: String,
     },
     UserLeft {
+        #[serde(default = "default_chat_server_id")]
+        server_id: String,
         username: String,
     },
     ProfileUpdated(UserProfile),

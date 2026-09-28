@@ -2,8 +2,8 @@ use argon2::Argon2;
 use argon2::password_hash::{PasswordHasher, PasswordVerifier, phc::PasswordHash};
 use base64::Engine;
 use protocol::{
-    Channel, ClientMessage, MAX_PROFILE_IMAGE_SIZE, Permission, ServerMessage, UserProfile,
-    UserRole,
+    Channel, ChatServer, ChatServerView, ClientMessage, DEFAULT_CHAT_SERVER_ID,
+    MAX_PROFILE_IMAGE_SIZE, Permission, ServerMessage, UserProfile, UserRole,
 };
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -28,18 +28,33 @@ const MAX_MESSAGE_LENGTH: usize = 4096;
 const MAX_REQUEST_LENGTH: usize = 1_500_000;
 const MAX_CONNECTIONS: usize = 128;
 const MAX_CHANNELS: usize = 100;
+const MAX_CHAT_SERVER_MEMBERS: usize = 100;
 const MAX_CHANNEL_NAME_LENGTH: usize = 32;
 const MAX_CHANNEL_TOPIC_LENGTH: usize = 160;
+const MAX_CHAT_SERVER_NAME_LENGTH: usize = 32;
+
+fn default_chat_server() -> ChatServer {
+    ChatServer {
+        id: DEFAULT_CHAT_SERVER_ID.to_string(),
+        name: "GlefChat".to_string(),
+        icon: None,
+    }
+}
 
 fn default_channels() -> Vec<Channel> {
     vec![Channel {
         id: protocol::DEFAULT_CHANNEL_ID.to_string(),
+        server_id: DEFAULT_CHAT_SERVER_ID.to_string(),
         name: "general".to_string(),
         topic: "General conversation".to_string(),
     }]
 }
 
 fn default_next_channel_id() -> u64 {
+    2
+}
+
+fn default_next_chat_server_id() -> u64 {
     2
 }
 
@@ -56,8 +71,14 @@ struct UserStore {
     session_tokens: HashMap<String, String>,
     #[serde(default)]
     channels: Vec<Channel>,
+    #[serde(default)]
+    chat_servers: Vec<ChatServer>,
+    #[serde(default)]
+    server_members: HashMap<String, HashSet<String>>,
     #[serde(default = "default_next_channel_id")]
     next_channel_id: u64,
+    #[serde(default = "default_next_chat_server_id")]
+    next_chat_server_id: u64,
     #[serde(skip)]
     bootstrap_admins: HashSet<String>,
     #[serde(skip)]
@@ -67,41 +88,55 @@ struct UserStore {
 #[derive(Clone)]
 enum Broadcast {
     ChatMessage {
+        server_id: String,
         channel_id: String,
         author: String,
         content: String,
     },
-    Channels(Vec<Channel>),
+    Channels {
+        server_id: String,
+        channels: Vec<Channel>,
+    },
+    ChatServers,
     ProfileUpdated(UserProfile),
     UserJoined {
+        server_id: String,
         username: String,
     },
     UserLeft {
+        server_id: String,
         username: String,
     },
 }
 
 struct OnlinePresence {
     sender: broadcast::Sender<Broadcast>,
-    username: Option<String>,
+    identity: Option<(String, String)>,
 }
 
 impl OnlinePresence {
     fn new(sender: broadcast::Sender<Broadcast>) -> Self {
         Self {
             sender,
-            username: None,
+            identity: None,
         }
     }
 
-    fn joined(&mut self, username: String) {
-        self.username = Some(username.clone());
-        let _ = self.sender.send(Broadcast::UserJoined { username });
+    fn joined(&mut self, server_id: String, username: String) {
+        self.left();
+        self.identity = Some((server_id.clone(), username.clone()));
+        let _ = self.sender.send(Broadcast::UserJoined {
+            server_id,
+            username,
+        });
     }
 
     fn left(&mut self) {
-        if let Some(username) = self.username.take() {
-            let _ = self.sender.send(Broadcast::UserLeft { username });
+        if let Some((server_id, username)) = self.identity.take() {
+            let _ = self.sender.send(Broadcast::UserLeft {
+                server_id,
+                username,
+            });
         }
     }
 }
@@ -129,6 +164,82 @@ fn valid_channel_name(name: &str) -> bool {
 
 fn valid_channel_topic(topic: &str) -> bool {
     topic.len() <= MAX_CHANNEL_TOPIC_LENGTH && !topic.chars().any(char::is_control)
+}
+
+fn valid_chat_server_name(name: &str) -> bool {
+    (2..=MAX_CHAT_SERVER_NAME_LENGTH).contains(&name.len()) && !name.chars().any(char::is_control)
+}
+
+fn chat_server_views(store: &UserStore, username: &str) -> Vec<ChatServerView> {
+    store
+        .chat_servers
+        .iter()
+        .map(|server| {
+            let members = store.server_members.get(&server.id);
+            ChatServerView {
+                id: server.id.clone(),
+                name: server.name.clone(),
+                icon: server.icon.clone(),
+                member_count: members.map_or(0, |members| members.len() as u32),
+                is_member: members.is_some_and(|members| members.contains(username)),
+            }
+        })
+        .collect()
+}
+
+fn preferred_chat_server(store: &UserStore, username: &str) -> Option<String> {
+    store
+        .chat_servers
+        .iter()
+        .find(|server| {
+            store
+                .server_members
+                .get(&server.id)
+                .is_some_and(|members| members.contains(username))
+        })
+        .map(|server| server.id.clone())
+}
+
+fn server_channels(store: &UserStore, server_id: &str) -> Vec<Channel> {
+    store
+        .channels
+        .iter()
+        .filter(|channel| channel.server_id == server_id)
+        .cloned()
+        .collect()
+}
+
+fn add_chat_server_member(
+    store: &mut UserStore,
+    server_id: &str,
+    username: &str,
+) -> Result<bool, &'static str> {
+    if !store
+        .chat_servers
+        .iter()
+        .any(|server| server.id == server_id)
+    {
+        return Err("That server does not exist.");
+    }
+    let members = store
+        .server_members
+        .entry(server_id.to_string())
+        .or_default();
+    if members.contains(username) {
+        return Ok(false);
+    }
+    if members.len() >= MAX_CHAT_SERVER_MEMBERS {
+        return Err("That server is full (100 members maximum).");
+    }
+    members.insert(username.to_string());
+    Ok(true)
+}
+
+fn remove_chat_server_member(store: &mut UserStore, server_id: &str, username: &str) -> bool {
+    store
+        .server_members
+        .get_mut(server_id)
+        .is_some_and(|members| members.remove(username))
 }
 
 fn user_profile(store: &UserStore, username: &str) -> UserProfile {
@@ -208,12 +319,37 @@ impl UserStore {
                 changed = true;
             }
         }
+        if store.chat_servers.is_empty() {
+            store.chat_servers.push(default_chat_server());
+            changed = true;
+        }
         if store.channels.is_empty() {
             store.channels = default_channels();
             changed = true;
         }
+        if store
+            .server_members
+            .get(DEFAULT_CHAT_SERVER_ID)
+            .is_none_or(HashSet::is_empty)
+            && !store.users.is_empty()
+        {
+            let mut usernames: Vec<_> = store.users.keys().cloned().collect();
+            usernames.sort();
+            let members = store
+                .server_members
+                .entry(DEFAULT_CHAT_SERVER_ID.to_string())
+                .or_default();
+            for username in usernames.into_iter().take(MAX_CHAT_SERVER_MEMBERS) {
+                members.insert(username);
+            }
+            changed = true;
+        }
         if store.next_channel_id == 0 {
             store.next_channel_id = default_next_channel_id();
+            changed = true;
+        }
+        if store.next_chat_server_id == 0 {
+            store.next_chat_server_id = default_next_chat_server_id();
             changed = true;
         }
         if changed {
@@ -446,6 +582,7 @@ async fn handle_connection(
     let mut reader = AsyncBufReader::new(reader);
     let mut authenticated_user: Option<String> = None;
     let mut authenticated_session_hash: Option<String> = None;
+    let mut active_server_id: Option<String> = None;
     let mut presence = OnlinePresence::new(tx.clone());
 
     loop {
@@ -520,6 +657,14 @@ async fn handle_connection(
                                     UserRole::Member
                                 };
                                 store.roles.insert(username.clone(), role);
+                                let members = store
+                                    .server_members
+                                    .entry(DEFAULT_CHAT_SERVER_ID.to_string())
+                                    .or_default();
+                                let joined_default = members.len() < MAX_CHAT_SERVER_MEMBERS;
+                                if joined_default {
+                                    members.insert(username.clone());
+                                }
                                 let previous_session = store.session_tokens.insert(username.clone(), session_hash.clone());
                                 if let Err(err) = store.save() {
                                     store.users.remove(&username);
@@ -529,22 +674,40 @@ async fn handle_connection(
                                     } else {
                                         store.session_tokens.remove(&username);
                                     }
+                                    if joined_default {
+                                        remove_chat_server_member(
+                                            &mut store,
+                                            DEFAULT_CHAT_SERVER_ID,
+                                            &username,
+                                        );
+                                    }
                                     return Err(err);
                                 }
                                 authenticated_user = Some(username.clone());
                                 authenticated_session_hash = Some(session_hash);
-                                presence.joined(username.clone());
+                                active_server_id = preferred_chat_server(&store, &username);
+                                if let Some(server_id) = active_server_id.as_ref() {
+                                    presence.joined(server_id.clone(), username.clone());
+                                }
                                 let profile = user_profile(&store, &username);
                                 send_response(&mut writer, ServerMessage::Authenticated {
-                                    username,
+                                    username: username.clone(),
                                     picture: profile.picture,
                                     banner: profile.banner,
                                     role: profile.role,
                                     session_token,
                                 }).await?;
-                                send_response(&mut writer, ServerMessage::Channels {
-                                    channels: store.channels.clone(),
+                                send_response(&mut writer, ServerMessage::ChatServers {
+                                    servers: chat_server_views(&store, &username),
+                                    active_server_id: active_server_id.clone().unwrap_or_default(),
                                 }).await?;
+                                if let Some(server_id) = active_server_id.as_ref() {
+                                    send_response(&mut writer, ServerMessage::Channels {
+                                        server_id: server_id.clone(),
+                                        channels: server_channels(&store, server_id),
+                                    }).await?;
+                                }
+                                let _ = tx.send(Broadcast::ChatServers);
                             }
                         }
                     }
@@ -594,18 +757,28 @@ async fn handle_connection(
                             }
                             authenticated_user = Some(username.clone());
                             authenticated_session_hash = Some(session_hash);
-                            presence.joined(username.clone());
+                            active_server_id = preferred_chat_server(&store, &username);
+                            if let Some(server_id) = active_server_id.as_ref() {
+                                presence.joined(server_id.clone(), username.clone());
+                            }
                             let profile = user_profile(&store, &username);
                             send_response(&mut writer, ServerMessage::Authenticated {
-                                username,
+                                username: username.clone(),
                                 picture: profile.picture,
                                 banner: profile.banner,
                                 role: profile.role,
                                 session_token,
                             }).await?;
-                            send_response(&mut writer, ServerMessage::Channels {
-                                channels: store.channels.clone(),
+                            send_response(&mut writer, ServerMessage::ChatServers {
+                                servers: chat_server_views(&store, &username),
+                                active_server_id: active_server_id.clone().unwrap_or_default(),
                             }).await?;
+                            if let Some(server_id) = active_server_id.as_ref() {
+                                send_response(&mut writer, ServerMessage::Channels {
+                                    server_id: server_id.clone(),
+                                    channels: server_channels(&store, server_id),
+                                }).await?;
+                            }
                         } else {
                             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                             send_response(&mut writer, ServerMessage::AuthenticationFailed {
@@ -657,18 +830,28 @@ async fn handle_connection(
                         };
                         authenticated_user = Some(username.clone());
                         authenticated_session_hash = Some(session_hash);
-                        presence.joined(username.clone());
+                        active_server_id = preferred_chat_server(&store, &username);
+                        if let Some(server_id) = active_server_id.as_ref() {
+                            presence.joined(server_id.clone(), username.clone());
+                        }
                         let profile = user_profile(&store, &username);
                         send_response(&mut writer, ServerMessage::Authenticated {
-                            username,
+                            username: username.clone(),
                             picture: profile.picture,
                             banner: profile.banner,
                             role: profile.role,
                             session_token,
                         }).await?;
-                        send_response(&mut writer, ServerMessage::Channels {
-                            channels: store.channels.clone(),
+                        send_response(&mut writer, ServerMessage::ChatServers {
+                            servers: chat_server_views(&store, &username),
+                            active_server_id: active_server_id.clone().unwrap_or_default(),
                         }).await?;
+                        if let Some(server_id) = active_server_id.as_ref() {
+                            send_response(&mut writer, ServerMessage::Channels {
+                                server_id: server_id.clone(),
+                                channels: server_channels(&store, server_id),
+                            }).await?;
+                        }
                     }
                     ClientMessage::Logout => {
                         presence.left();
@@ -684,16 +867,211 @@ async fn handle_connection(
                         }
                         authenticated_user = None;
                         authenticated_session_hash = None;
+                        active_server_id = None;
                         send_response(&mut writer, ServerMessage::LoggedOut).await?;
                     }
-                    ClientMessage::SendMessage { channel_id, content } => {
+                    ClientMessage::CreateChatServer { name, icon } => {
+                        let Some(username) = authenticated_user.as_ref() else {
+                            send_response(&mut writer, ServerMessage::AuthenticationFailed {
+                                message: "Sign in before creating a server.".to_string(),
+                            }).await?;
+                            continue;
+                        };
+                        let name = name.trim().to_string();
+                        if !valid_chat_server_name(&name) {
+                            send_response(&mut writer, ServerMessage::Error {
+                                message: "Server names must contain 2-32 characters and no control characters.".to_string(),
+                            }).await?;
+                            continue;
+                        }
+                        if !valid_profile_image(&icon) {
+                            send_response(&mut writer, ServerMessage::Error {
+                                message: "Server icons must be valid images no larger than 512 KiB.".to_string(),
+                            }).await?;
+                            continue;
+                        }
+                        let mut store = users.lock().await;
+                        if store.chat_servers.iter().any(|server| server.name.eq_ignore_ascii_case(&name)) {
+                            send_response(&mut writer, ServerMessage::Error {
+                                message: "A server with that name already exists.".to_string(),
+                            }).await?;
+                            continue;
+                        }
+                        let previous_server_id = store.next_chat_server_id;
+                        let previous_channel_id = store.next_channel_id;
+                        let (Some(next_server_id), Some(next_channel_id)) = (
+                            previous_server_id.checked_add(1),
+                            previous_channel_id.checked_add(1),
+                        ) else {
+                            send_response(&mut writer, ServerMessage::Error {
+                                message: "No more server or channel IDs are available.".to_string(),
+                            }).await?;
+                            continue;
+                        };
+                        let server_id = previous_server_id.to_string();
+                        let channel_id = previous_channel_id.to_string();
+                        store.chat_servers.push(ChatServer { id: server_id.clone(), name, icon });
+                        store.server_members.insert(server_id.clone(), HashSet::from([username.clone()]));
+                        store.channels.push(Channel {
+                            id: channel_id,
+                            server_id: server_id.clone(),
+                            name: "general".to_string(),
+                            topic: "General conversation".to_string(),
+                        });
+                        store.next_chat_server_id = next_server_id;
+                        store.next_channel_id = next_channel_id;
+                        let views = chat_server_views(&store, username);
+                        let channels = server_channels(&store, &server_id);
+                        let snapshot = store.clone();
+                        drop(store);
+                        if let Err(err) = tokio::task::spawn_blocking(move || snapshot.save())
+                            .await
+                            .map_err(io::Error::other)?
+                        {
+                            let mut store = users.lock().await;
+                            store.chat_servers.retain(|server| server.id != server_id);
+                            store.server_members.remove(&server_id);
+                            store.channels.retain(|channel| channel.server_id != server_id);
+                            store.next_chat_server_id = previous_server_id;
+                            store.next_channel_id = previous_channel_id;
+                            return Err(err);
+                        }
+                        active_server_id = Some(server_id.clone());
+                        presence.joined(server_id.clone(), username.clone());
+                        let _ = tx.send(Broadcast::ChatServers);
+                        send_response(&mut writer, ServerMessage::ChatServers {
+                            servers: views,
+                            active_server_id: server_id.clone(),
+                        }).await?;
+                        send_response(&mut writer, ServerMessage::Channels { server_id, channels }).await?;
+                    }
+                    ClientMessage::JoinChatServer { server_id } => {
+                        let Some(username) = authenticated_user.as_ref() else {
+                            send_response(&mut writer, ServerMessage::AuthenticationFailed {
+                                message: "Sign in before joining a server.".to_string(),
+                            }).await?;
+                            continue;
+                        };
+                        let mut store = users.lock().await;
+                        let added = match add_chat_server_member(&mut store, &server_id, username) {
+                            Ok(added) => added,
+                            Err(message) => {
+                                send_response(&mut writer, ServerMessage::Error { message: message.to_string() }).await?;
+                                continue;
+                            }
+                        };
+                        if added {
+                            let snapshot = store.clone();
+                            drop(store);
+                            if let Err(err) = tokio::task::spawn_blocking(move || snapshot.save())
+                                .await
+                                .map_err(io::Error::other)?
+                            {
+                                let mut store = users.lock().await;
+                                remove_chat_server_member(&mut store, &server_id, username);
+                                return Err(err);
+                            }
+                            store = users.lock().await;
+                        }
+                        let views = chat_server_views(&store, username);
+                        let channels = server_channels(&store, &server_id);
+                        drop(store);
+                        if active_server_id.as_deref() != Some(server_id.as_str()) {
+                            active_server_id = Some(server_id.clone());
+                            presence.joined(server_id.clone(), username.clone());
+                        }
+                        if added {
+                            let _ = tx.send(Broadcast::ChatServers);
+                        }
+                        send_response(&mut writer, ServerMessage::ChatServers {
+                            servers: views,
+                            active_server_id: server_id.clone(),
+                        }).await?;
+                        send_response(&mut writer, ServerMessage::Channels { server_id, channels }).await?;
+                    }
+                    ClientMessage::SelectChatServer { server_id } => {
+                        let Some(username) = authenticated_user.as_ref() else {
+                            send_response(&mut writer, ServerMessage::AuthenticationFailed {
+                                message: "Sign in before switching servers.".to_string(),
+                            }).await?;
+                            continue;
+                        };
+                        let store = users.lock().await;
+                        if !store.server_members.get(&server_id).is_some_and(|members| members.contains(username)) {
+                            send_response(&mut writer, ServerMessage::Error {
+                                message: "Join that server before switching to it.".to_string(),
+                            }).await?;
+                            continue;
+                        }
+                        let views = chat_server_views(&store, username);
+                        let channels = server_channels(&store, &server_id);
+                        drop(store);
+                        if active_server_id.as_deref() != Some(server_id.as_str()) {
+                            active_server_id = Some(server_id.clone());
+                            presence.joined(server_id.clone(), username.clone());
+                        }
+                        send_response(&mut writer, ServerMessage::ChatServers {
+                            servers: views,
+                            active_server_id: server_id.clone(),
+                        }).await?;
+                        send_response(&mut writer, ServerMessage::Channels { server_id, channels }).await?;
+                    }
+                    ClientMessage::LeaveChatServer { server_id } => {
+                        let Some(username) = authenticated_user.as_ref() else {
+                            send_response(&mut writer, ServerMessage::AuthenticationFailed {
+                                message: "Sign in before leaving a server.".to_string(),
+                            }).await?;
+                            continue;
+                        };
+                        let mut store = users.lock().await;
+                        if !remove_chat_server_member(&mut store, &server_id, username) {
+                            send_response(&mut writer, ServerMessage::Error {
+                                message: "You are not a member of that server.".to_string(),
+                            }).await?;
+                            continue;
+                        }
+                        let snapshot = store.clone();
+                        if let Err(err) = snapshot.save() {
+                            add_chat_server_member(&mut store, &server_id, username).ok();
+                            return Err(err);
+                        }
+                        let was_active = active_server_id.as_deref() == Some(server_id.as_str());
+                        if was_active {
+                            presence.left();
+                            active_server_id = preferred_chat_server(&store, username);
+                            if let Some(next_server) = active_server_id.as_ref() {
+                                presence.joined(next_server.clone(), username.clone());
+                            }
+                        }
+                        let views = chat_server_views(&store, username);
+                        let next_id = active_server_id.clone().unwrap_or_default();
+                        let channels = active_server_id.as_deref().map_or_else(Vec::new, |id| server_channels(&store, id));
+                        drop(store);
+                        let _ = tx.send(Broadcast::ChatServers);
+                        send_response(&mut writer, ServerMessage::ChatServers {
+                            servers: views,
+                            active_server_id: next_id.clone(),
+                        }).await?;
+                        send_response(&mut writer, ServerMessage::Channels {
+                            server_id: next_id,
+                            channels,
+                        }).await?;
+                    }
+                    ClientMessage::SendMessage { server_id, channel_id, content } => {
                         let Some(author) = authenticated_user.as_ref() else {
                             send_response(&mut writer, ServerMessage::AuthenticationFailed {
                                 message: "Sign in before sending messages.".to_string(),
                             }).await?;
                             continue;
                         };
-                        if !users.lock().await.channels.iter().any(|channel| channel.id == channel_id) {
+                        let store = users.lock().await;
+                        let is_member = store.server_members.get(&server_id)
+                            .is_some_and(|members| members.contains(author));
+                        if active_server_id.as_deref() != Some(server_id.as_str()) || !is_member {
+                            send_response(&mut writer, ServerMessage::Error {
+                                message: "Join that server before sending messages.".to_string(),
+                            }).await?;
+                        } else if !store.channels.iter().any(|channel| channel.server_id == server_id && channel.id == channel_id) {
                             send_response(&mut writer, ServerMessage::Error {
                                 message: "That channel does not exist.".to_string(),
                             }).await?;
@@ -703,6 +1081,7 @@ async fn handle_connection(
                             }).await?;
                         } else {
                             let _ = tx.send(Broadcast::ChatMessage {
+                                server_id,
                                 channel_id,
                                 author: author.clone(),
                                 content,
@@ -716,9 +1095,21 @@ async fn handle_connection(
                             }).await?;
                             continue;
                         };
+                        let Some(server_id) = active_server_id.as_ref() else {
+                            send_response(&mut writer, ServerMessage::Error {
+                                message: "Join a server before managing channels.".to_string(),
+                            }).await?;
+                            continue;
+                        };
                         let name = name.trim().to_ascii_lowercase();
                         let topic = topic.trim().to_string();
                         let mut store = users.lock().await;
+                        if !store.server_members.get(server_id).is_some_and(|members| members.contains(actor)) {
+                            send_response(&mut writer, ServerMessage::Error {
+                                message: "Join that server before managing its channels.".to_string(),
+                            }).await?;
+                            continue;
+                        }
                         let actor_role = store.roles.get(actor).copied().unwrap_or_default();
                         if !actor_role.has_permission(Permission::ManageChannels) {
                             send_response(&mut writer, ServerMessage::Error {
@@ -732,13 +1123,13 @@ async fn handle_connection(
                             }).await?;
                             continue;
                         }
-                        if store.channels.len() >= MAX_CHANNELS {
+                        if store.channels.iter().filter(|channel| channel.server_id == *server_id).count() >= MAX_CHANNELS {
                             send_response(&mut writer, ServerMessage::Error {
-                                message: "The server has reached its channel limit.".to_string(),
+                                message: "This server has reached its channel limit.".to_string(),
                             }).await?;
                             continue;
                         }
-                        if store.channels.iter().any(|channel| channel.name == name) {
+                        if store.channels.iter().any(|channel| channel.server_id == *server_id && channel.name == name) {
                             send_response(&mut writer, ServerMessage::Error {
                                 message: "A channel with that name already exists.".to_string(),
                             }).await?;
@@ -753,12 +1144,13 @@ async fn handle_connection(
                         };
                         store.channels.push(Channel {
                             id: previous_next_id.to_string(),
+                            server_id: server_id.clone(),
                             name,
                             topic,
                         });
                         store.next_channel_id = next_id;
                         let snapshot = store.clone();
-                        let channels = store.channels.clone();
+                        let channels = server_channels(&store, server_id);
                         drop(store);
                         if let Err(err) = tokio::task::spawn_blocking(move || snapshot.save())
                             .await
@@ -769,7 +1161,7 @@ async fn handle_connection(
                             store.next_channel_id = previous_next_id;
                             return Err(err);
                         }
-                        let _ = tx.send(Broadcast::Channels(channels));
+                            let _ = tx.send(Broadcast::Channels { server_id: server_id.clone(), channels });
                     }
                     ClientMessage::EditChannel { channel_id, name, topic } => {
                         let Some(actor) = authenticated_user.as_ref() else {
@@ -778,9 +1170,21 @@ async fn handle_connection(
                             }).await?;
                             continue;
                         };
+                        let Some(server_id) = active_server_id.as_ref() else {
+                            send_response(&mut writer, ServerMessage::Error {
+                                message: "Join a server before managing channels.".to_string(),
+                            }).await?;
+                            continue;
+                        };
                         let name = name.trim().to_ascii_lowercase();
                         let topic = topic.trim().to_string();
                         let mut store = users.lock().await;
+                        if !store.server_members.get(server_id).is_some_and(|members| members.contains(actor)) {
+                            send_response(&mut writer, ServerMessage::Error {
+                                message: "Join that server before managing its channels.".to_string(),
+                            }).await?;
+                            continue;
+                        }
                         let actor_role = store.roles.get(actor).copied().unwrap_or_default();
                         if !actor_role.has_permission(Permission::ManageChannels) {
                             send_response(&mut writer, ServerMessage::Error {
@@ -794,13 +1198,13 @@ async fn handle_connection(
                             }).await?;
                             continue;
                         }
-                        let Some(index) = store.channels.iter().position(|channel| channel.id == channel_id) else {
+                        let Some(index) = store.channels.iter().position(|channel| channel.server_id == *server_id && channel.id == channel_id) else {
                             send_response(&mut writer, ServerMessage::Error {
                                 message: "That channel does not exist.".to_string(),
                             }).await?;
                             continue;
                         };
-                        if store.channels.iter().any(|channel| channel.id != channel_id && channel.name == name) {
+                        if store.channels.iter().any(|channel| channel.server_id == *server_id && channel.id != channel_id && channel.name == name) {
                             send_response(&mut writer, ServerMessage::Error {
                                 message: "A channel with that name already exists.".to_string(),
                             }).await?;
@@ -810,7 +1214,7 @@ async fn handle_connection(
                         store.channels[index].name = name.clone();
                         store.channels[index].topic = topic.clone();
                         let snapshot = store.clone();
-                        let channels = store.channels.clone();
+                        let channels = server_channels(&store, server_id);
                         drop(store);
                         if let Err(err) = tokio::task::spawn_blocking(move || snapshot.save())
                             .await
@@ -824,7 +1228,7 @@ async fn handle_connection(
                             }
                             return Err(err);
                         }
-                        let _ = tx.send(Broadcast::Channels(channels));
+                        let _ = tx.send(Broadcast::Channels { server_id: server_id.clone(), channels });
                     }
                     ClientMessage::GetProfile { username } => {
                         if authenticated_user.is_none() {
@@ -954,14 +1358,23 @@ async fn handle_connection(
             }
             result = rx.recv() => {
                 match result {
-                    Ok(Broadcast::ChatMessage { channel_id, author, content }) => {
-                        if authenticated_user.is_some() {
-                            send_response(&mut writer, ServerMessage::ChatMessage { channel_id, author, content }).await?;
+                    Ok(Broadcast::ChatMessage { server_id, channel_id, author, content }) => {
+                        if active_server_id.as_deref() == Some(server_id.as_str()) {
+                            send_response(&mut writer, ServerMessage::ChatMessage { server_id, channel_id, author, content }).await?;
                         }
                     }
-                    Ok(Broadcast::Channels(channels)) => {
-                        if authenticated_user.is_some() {
-                            send_response(&mut writer, ServerMessage::Channels { channels }).await?;
+                    Ok(Broadcast::Channels { server_id, channels }) => {
+                        if active_server_id.as_deref() == Some(server_id.as_str()) {
+                            send_response(&mut writer, ServerMessage::Channels { server_id, channels }).await?;
+                        }
+                    }
+                    Ok(Broadcast::ChatServers) => {
+                        if let Some(username) = authenticated_user.as_deref() {
+                            let store = users.lock().await;
+                            send_response(&mut writer, ServerMessage::ChatServers {
+                                servers: chat_server_views(&store, username),
+                                active_server_id: active_server_id.clone().unwrap_or_default(),
+                            }).await?;
                         }
                     }
                     Ok(Broadcast::ProfileUpdated(profile)) => {
@@ -977,14 +1390,14 @@ async fn handle_connection(
                             send_response(&mut writer, ServerMessage::ProfileUpdated(profile)).await?;
                         }
                     }
-                    Ok(Broadcast::UserJoined { username }) => {
-                        if authenticated_user.is_some() {
-                            send_response(&mut writer, ServerMessage::UserJoined { username }).await?;
+                    Ok(Broadcast::UserJoined { server_id, username }) => {
+                        if active_server_id.as_deref() == Some(server_id.as_str()) {
+                            send_response(&mut writer, ServerMessage::UserJoined { server_id, username }).await?;
                         }
                     }
-                    Ok(Broadcast::UserLeft { username }) => {
-                        if authenticated_user.is_some() {
-                            send_response(&mut writer, ServerMessage::UserLeft { username }).await?;
+                    Ok(Broadcast::UserLeft { server_id, username }) => {
+                        if active_server_id.as_deref() == Some(server_id.as_str()) {
+                            send_response(&mut writer, ServerMessage::UserLeft { server_id, username }).await?;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -1003,12 +1416,15 @@ async fn handle_connection(
 #[cfg(test)]
 mod tests {
     use super::{
-        UserStore, can_moderate_user, default_channels, default_next_channel_id, handle_connection,
-        hash_password, parse_admin_usernames, role_change_error, tls_acceptor_with_paths,
-        valid_channel_name, valid_channel_topic, valid_profile_image, valid_username,
-        verify_password,
+        UserStore, add_chat_server_member, can_moderate_user, default_channels,
+        default_chat_server, default_next_channel_id, default_next_chat_server_id,
+        handle_connection, hash_password, parse_admin_usernames, role_change_error,
+        tls_acceptor_with_paths, valid_channel_name, valid_channel_topic, valid_profile_image,
+        valid_username, verify_password,
     };
-    use crate::protocol::{ClientMessage, DEFAULT_CHANNEL_ID, ServerMessage, UserProfile};
+    use crate::protocol::{
+        ClientMessage, DEFAULT_CHANNEL_ID, DEFAULT_CHAT_SERVER_ID, ServerMessage, UserProfile,
+    };
     use crate::protocol::{MAX_PROFILE_IMAGE_SIZE, Permission, UserRole};
     use base64::Engine;
     use rustls::pki_types::ServerName;
@@ -1017,7 +1433,8 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::fs::File;
     use std::io::{self, BufReader};
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::path::Path;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::io::{
@@ -1040,6 +1457,18 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).await?;
         serde_json::from_str(&line).map_err(io::Error::other)
+    }
+
+    async fn read_until(
+        reader: &mut (impl AsyncBufRead + Unpin),
+        mut matches: impl FnMut(&ServerMessage) -> bool,
+    ) -> io::Result<ServerMessage> {
+        loop {
+            let message = read_message(reader).await?;
+            if matches(&message) {
+                return Ok(message);
+            }
+        }
     }
 
     struct TestServer {
@@ -1077,6 +1506,7 @@ mod tests {
                     hash_password("correct horse battery staple").unwrap(),
                 );
             }
+            let default_members = roles.keys().cloned().collect();
             let users = Arc::new(Mutex::new(UserStore {
                 users: users_map,
                 profiles: HashMap::new(),
@@ -1084,7 +1514,13 @@ mod tests {
                 banned_users: HashSet::new(),
                 session_tokens: HashMap::new(),
                 channels: default_channels(),
+                chat_servers: vec![default_chat_server()],
+                server_members: HashMap::from([(
+                    DEFAULT_CHAT_SERVER_ID.to_string(),
+                    default_members,
+                )]),
                 next_channel_id: default_next_channel_id(),
+                next_chat_server_id: default_next_chat_server_id(),
                 bootstrap_admins: HashSet::new(),
                 store_path: Some(users_path.clone()),
             }));
@@ -1156,6 +1592,10 @@ mod tests {
         ));
         assert!(matches!(
             read_message(reader).await?,
+            ServerMessage::ChatServers { .. }
+        ));
+        assert!(matches!(
+            read_message(reader).await?,
             ServerMessage::Channels { .. }
         ));
         assert!(matches!(
@@ -1192,6 +1632,30 @@ mod tests {
         assert!(valid_channel_topic("A useful topic"));
         assert!(!valid_channel_topic("line\nbreak"));
         assert!(!valid_channel_topic(&"a".repeat(161)));
+    }
+
+    #[test]
+    fn chat_servers_never_exceed_one_hundred_members() {
+        let mut store = UserStore {
+            chat_servers: vec![default_chat_server()],
+            ..UserStore::default()
+        };
+        for index in 0..100 {
+            assert!(
+                add_chat_server_member(
+                    &mut store,
+                    DEFAULT_CHAT_SERVER_ID,
+                    &format!("user-{index}")
+                )
+                .unwrap()
+            );
+        }
+        assert_eq!(store.server_members[DEFAULT_CHAT_SERVER_ID].len(), 100);
+        assert_eq!(
+            add_chat_server_member(&mut store, DEFAULT_CHAT_SERVER_ID, "overflow"),
+            Err("That server is full (100 members maximum).")
+        );
+        assert_eq!(store.server_members[DEFAULT_CHAT_SERVER_ID].len(), 100);
     }
 
     #[test]
@@ -1313,6 +1777,8 @@ mod tests {
         assert!(verify_password(password, hash));
         assert_eq!(restored.channels, default_channels());
         assert_eq!(restored.next_channel_id, default_next_channel_id());
+        assert_eq!(restored.chat_servers, vec![default_chat_server()]);
+        assert_eq!(restored.server_members[DEFAULT_CHAT_SERVER_ID].len(), 1);
 
         std::fs::remove_dir_all(test_dir)?;
         Ok(())
@@ -1354,7 +1820,13 @@ mod tests {
             banned_users: HashSet::new(),
             session_tokens: HashMap::new(),
             channels: default_channels(),
+            chat_servers: vec![default_chat_server()],
+            server_members: HashMap::from([(
+                DEFAULT_CHAT_SERVER_ID.to_string(),
+                HashSet::from(["alice".to_string()]),
+            )]),
             next_channel_id: default_next_channel_id(),
+            next_chat_server_id: default_next_chat_server_id(),
             bootstrap_admins: HashSet::new(),
             store_path: Some(users_path.clone()),
         }));
@@ -1388,6 +1860,7 @@ mod tests {
         send_message(
             &mut writer,
             &ClientMessage::SendMessage {
+                server_id: DEFAULT_CHAT_SERVER_ID.to_string(),
                 channel_id: DEFAULT_CHANNEL_ID.to_string(),
                 content: "spoof attempt".to_string(),
             },
@@ -1413,12 +1886,16 @@ mod tests {
         ));
         assert!(matches!(
             read_message(&mut reader).await?,
-            ServerMessage::Channels { channels }
+            ServerMessage::ChatServers { .. }
+        ));
+        assert!(matches!(
+            read_message(&mut reader).await?,
+            ServerMessage::Channels { channels, .. }
                 if channels == default_channels()
         ));
         assert!(matches!(
             read_message(&mut reader).await?,
-            ServerMessage::UserJoined { username } if username == "alice"
+            ServerMessage::UserJoined { username, .. } if username == "alice"
         ));
 
         send_message(
@@ -1483,6 +1960,7 @@ mod tests {
         send_message(
             &mut writer,
             &ClientMessage::SendMessage {
+                server_id: DEFAULT_CHAT_SERVER_ID.to_string(),
                 channel_id: DEFAULT_CHANNEL_ID.to_string(),
                 content: "authenticated message".to_string(),
             },
@@ -1513,26 +1991,143 @@ mod tests {
         ));
         assert!(matches!(
             read_message(&mut bob_reader).await?,
-            ServerMessage::Channels { channels }
-                if channels == default_channels()
+            ServerMessage::ChatServers { .. }
         ));
         assert!(matches!(
             read_message(&mut bob_reader).await?,
-            ServerMessage::UserJoined { username } if username == "bob"
+            ServerMessage::Channels { channels, .. }
+                if channels == default_channels()
         ));
         assert!(matches!(
-            read_message(&mut reader).await?,
-            ServerMessage::UserJoined { username } if username == "bob"
+            read_until(&mut bob_reader, |message| matches!(
+                message,
+                ServerMessage::UserJoined { username, .. } if username == "bob"
+            )).await?,
+            ServerMessage::UserJoined { username, .. } if username == "bob"
+        ));
+        assert!(matches!(
+            read_until(&mut reader, |message| matches!(
+                message,
+                ServerMessage::UserJoined { username, .. } if username == "bob"
+            )).await?,
+            ServerMessage::UserJoined { username, .. } if username == "bob"
+        ));
+
+        send_message(
+            &mut writer,
+            &ClientMessage::CreateChatServer {
+                name: "Side Room".to_string(),
+                icon: None,
+            },
+        )
+        .await?;
+        let created_server_directory = read_until(&mut reader, |message| {
+            matches!(message, ServerMessage::ChatServers { servers, .. }
+                if servers.iter().any(|server| server.name == "Side Room"))
+                || matches!(message, ServerMessage::Error { .. })
+        })
+        .await?;
+        let side_server_id = match created_server_directory {
+            ServerMessage::ChatServers {
+                active_server_id,
+                servers,
+            } => {
+                assert!(servers.iter().any(|server| server.name == "Side Room"));
+                active_server_id
+            }
+            message => panic!("expected server directory, received {message:?}"),
+        };
+        let side_channel_id = match read_message(&mut reader).await? {
+            ServerMessage::Channels {
+                server_id,
+                channels,
+            } => {
+                assert_eq!(server_id, side_server_id);
+                assert_eq!(channels.len(), 1);
+                assert_eq!(channels[0].name, "general");
+                assert_eq!(channels[0].server_id, side_server_id);
+                channels[0].id.clone()
+            }
+            message => panic!("expected server channels, received {message:?}"),
+        };
+        let directory_for_bob = read_until(&mut bob_reader, |message| {
+            matches!(message, ServerMessage::ChatServers { servers, .. }
+                if servers.iter().any(|server| server.id == side_server_id && !server.is_member))
+        })
+        .await?;
+        assert!(matches!(
+            directory_for_bob,
+            ServerMessage::ChatServers { ref servers, .. }
+                if servers.iter().any(|server| server.id == side_server_id && server.member_count == 1)
+        ));
+
+        send_message(
+            &mut bob_writer,
+            &ClientMessage::SendMessage {
+                server_id: side_server_id.clone(),
+                channel_id: side_channel_id.clone(),
+                content: "outsider message".to_string(),
+            },
+        )
+        .await?;
+        assert!(matches!(
+            read_until(&mut bob_reader, |message| matches!(message, ServerMessage::Error { .. })).await?,
+            ServerMessage::Error { message } if message == "Join that server before sending messages."
+        ));
+
+        send_message(
+            &mut bob_writer,
+            &ClientMessage::JoinChatServer {
+                server_id: side_server_id.clone(),
+            },
+        )
+        .await?;
+        assert!(matches!(
+            read_until(&mut bob_reader, |message| matches!(message,
+                ServerMessage::ChatServers { active_server_id, .. }
+                    if active_server_id == &side_server_id
+            ))
+            .await?,
+            ServerMessage::ChatServers { .. }
+        ));
+        assert!(matches!(
+            read_until(&mut bob_reader, |message| matches!(message,
+                ServerMessage::Channels { server_id, .. } if server_id == &side_server_id
+            ))
+            .await?,
+            ServerMessage::Channels { .. }
+        ));
+        send_message(
+            &mut bob_writer,
+            &ClientMessage::SendMessage {
+                server_id: side_server_id.clone(),
+                channel_id: side_channel_id,
+                content: "community-only message".to_string(),
+            },
+        )
+        .await?;
+        assert!(matches!(
+            read_until(&mut reader, |message| matches!(message,
+                ServerMessage::ChatMessage { content, .. } if content == "community-only message"
+            )).await?,
+            ServerMessage::ChatMessage { server_id, author, .. }
+                if server_id == side_server_id && author == "bob"
         ));
 
         send_message(&mut bob_writer, &ClientMessage::Logout).await?;
         assert!(matches!(
-            read_message(&mut bob_reader).await?,
+            read_until(&mut bob_reader, |message| matches!(
+                message,
+                ServerMessage::LoggedOut
+            ))
+            .await?,
             ServerMessage::LoggedOut
         ));
         assert!(matches!(
-            read_message(&mut reader).await?,
-            ServerMessage::UserLeft { username } if username == "bob"
+            read_until(&mut reader, |message| matches!(message,
+                ServerMessage::UserLeft { username, .. } if username == "bob"
+            )).await?,
+            ServerMessage::UserLeft { username, .. } if username == "bob"
         ));
 
         drop(bob_writer);

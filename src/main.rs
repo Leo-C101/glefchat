@@ -60,6 +60,8 @@ const MAX_STORED_MESSAGES: usize = 500;
 struct StoredMessage {
     #[serde(default = "protocol::default_channel_id")]
     channel_id: String,
+    #[serde(default = "protocol::default_chat_server_id")]
+    server_id: String,
     author: String,
     content: String,
     timestamp: String,
@@ -354,7 +356,10 @@ fn main() -> Result<(), slint::PlatformError> {
         .lock()
         .unwrap()
         .iter()
-        .filter(|stored| stored.channel_id == protocol::DEFAULT_CHANNEL_ID)
+        .filter(|stored| {
+            stored.channel_id == protocol::DEFAULT_CHANNEL_ID
+                && stored.server_id == protocol::DEFAULT_CHAT_SERVER_ID
+        })
         .map(|stored| {
             let mut message = Message::from(stored);
             if let Some(profile) = profiles.get(&stored.author) {
@@ -655,6 +660,7 @@ fn main() -> Result<(), slint::PlatformError> {
             let Some(win) = window.upgrade() else { return };
             if win.get_logged_in() {
                 let _ = outgoing_tx.send(ClientMessage::SendMessage {
+                    server_id: win.get_selected_chat_server_id().to_string(),
                     channel_id: win.get_selected_channel_id().to_string(),
                     content,
                 });
@@ -685,6 +691,60 @@ fn main() -> Result<(), slint::PlatformError> {
             let _ = outgoing_tx.send(ClientMessage::CreateChannel {
                 name: name.to_string(),
                 topic: topic.to_string(),
+            });
+        });
+    }
+
+    {
+        let window = main_window.as_weak();
+        let outgoing_tx = outgoing_tx.clone();
+        main_window.on_select_chat_server(move |server_id| {
+            let Some(win) = window.upgrade() else { return };
+            let server_id = server_id.to_string();
+            let is_member = win
+                .get_chat_servers()
+                .iter()
+                .any(|server| server.id == server_id && server.is_member);
+            let request = if is_member {
+                ClientMessage::SelectChatServer { server_id }
+            } else {
+                ClientMessage::JoinChatServer { server_id }
+            };
+            let _ = outgoing_tx.send(request);
+        });
+    }
+
+    let pending_server_icon = Arc::new(Mutex::new(None::<String>));
+    {
+        let outgoing_tx = outgoing_tx.clone();
+        let pending_server_icon = pending_server_icon.clone();
+        main_window.on_create_chat_server(move |name, has_icon| {
+            let icon = pending_server_icon.lock().unwrap().take();
+            let _ = outgoing_tx.send(ClientMessage::CreateChatServer {
+                name: name.to_string(),
+                icon: if has_icon { icon } else { None },
+            });
+        });
+    }
+
+    {
+        let window = main_window.as_weak();
+        let runtime_handle = runtime_handle.clone();
+        let pending_server_icon = pending_server_icon.clone();
+        main_window.on_choose_chat_server_icon(move || {
+            launch_server_icon_picker(
+                window.clone(),
+                runtime_handle.clone(),
+                pending_server_icon.clone(),
+            );
+        });
+    }
+
+    {
+        let outgoing_tx = outgoing_tx.clone();
+        main_window.on_leave_chat_server(move |server_id| {
+            let _ = outgoing_tx.send(ClientMessage::LeaveChatServer {
+                server_id: server_id.to_string(),
             });
         });
     }
@@ -801,6 +861,76 @@ fn launch_profile_image_picker(
             }
             window.set_profile_error("".into());
         });
+    });
+}
+
+fn launch_server_icon_picker(
+    window: Weak<MainWindow>,
+    runtime: tokio::runtime::Handle,
+    pending_server_icon: Arc<Mutex<Option<String>>>,
+) {
+    runtime.spawn(async move {
+        let selected = tokio::task::spawn_blocking(|| {
+            rfd::FileDialog::new()
+                .add_filter("Image files", &["png", "jpg", "jpeg", "webp"])
+                .pick_file()
+        })
+        .await;
+        let path = match selected {
+            Ok(Some(path)) => path,
+            Ok(None) => return,
+            Err(err) => {
+                set_server_icon_error(&window, format!("Could not open image picker: {err}"));
+                return;
+            }
+        };
+
+        let bytes = match async {
+            let metadata = tokio::fs::metadata(&path)
+                .await
+                .map_err(|err| err.to_string())?;
+            if metadata.len() > MAX_PROFILE_IMAGE_SIZE as u64 {
+                return Err("Choose an image no larger than 512 KiB.".to_string());
+            }
+            let bytes = tokio::fs::read(&path)
+                .await
+                .map_err(|err| err.to_string())?;
+            if bytes.is_empty() || bytes.len() > MAX_PROFILE_IMAGE_SIZE {
+                return Err("Choose an image no larger than 512 KiB.".to_string());
+            }
+            slint::Image::load_from_data(&bytes, None)
+                .map_err(|_| "Choose a valid PNG, JPEG, or WebP image.".to_string())?;
+            Ok::<_, String>(bytes)
+        }
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(message) => {
+                set_server_icon_error(&window, message);
+                return;
+            }
+        };
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let window = window.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(window) = window.upgrade() else {
+                return;
+            };
+            *pending_server_icon.lock().unwrap() = Some(encoded.clone());
+            window.set_new_server_icon(profile_image(&Some(encoded)));
+            window.set_new_server_icon_selected(true);
+            window.set_server_icon_error("".into());
+        });
+    });
+}
+
+fn set_server_icon_error(window: &Weak<MainWindow>, message: String) {
+    let window = window.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(window) = window.upgrade() {
+            window.set_server_icon_error(message.into());
+        }
     });
 }
 
@@ -1011,7 +1141,8 @@ fn append_stored_message(
 ) {
     let follow_chat_bottom = window.get_follow_chat_bottom();
     let model = window.get_messages();
-    if stored.channel_id == window.get_selected_channel_id().as_str()
+    if stored.server_id == window.get_selected_chat_server_id().as_str()
+        && stored.channel_id == window.get_selected_channel_id().as_str()
         && let Some(vec_model) = model.as_any().downcast_ref::<VecModel<Message>>()
     {
         let mut message = Message::from(&stored);
@@ -1047,6 +1178,7 @@ fn append_presence_message(
     window: &MainWindow,
     user_store: &Arc<Mutex<UserStore>>,
     stored_messages: &Arc<Mutex<Vec<StoredMessage>>>,
+    server_id: String,
     username: String,
     joined: bool,
 ) {
@@ -1056,7 +1188,13 @@ fn append_presence_message(
         user_store,
         stored_messages,
         StoredMessage {
-            channel_id: protocol::DEFAULT_CHANNEL_ID.to_string(),
+            channel_id: window
+                .get_channels()
+                .iter()
+                .next()
+                .map(|channel| channel.id.to_string())
+                .unwrap_or_else(|| protocol::DEFAULT_CHANNEL_ID.to_string()),
+            server_id,
             author: String::new(),
             content: format!("{username} {verb} the chat"),
             timestamp: current_timestamp(),
@@ -1071,12 +1209,13 @@ fn refresh_visible_messages(
     user_store: &Arc<Mutex<UserStore>>,
 ) {
     let channel_id = window.get_selected_channel_id().to_string();
+    let server_id = window.get_selected_chat_server_id().to_string();
     let profiles = user_store.lock().unwrap().profiles.clone();
     let messages = stored_messages
         .lock()
         .unwrap()
         .iter()
-        .filter(|stored| stored.channel_id == channel_id)
+        .filter(|stored| stored.server_id == server_id && stored.channel_id == channel_id)
         .map(|stored| {
             let mut message = Message::from(stored);
             if let Some(profile) = profiles.get(&stored.author) {
@@ -1223,19 +1362,41 @@ fn apply_server_message(
                     eprintln!("failed to cache user profile: {err}");
                 }
             }
-            ServerMessage::UserJoined { username } => {
-                append_presence_message(&window, &user_store, &stored_messages, username, true);
+            ServerMessage::UserJoined {
+                server_id,
+                username,
+            } => {
+                append_presence_message(
+                    &window,
+                    &user_store,
+                    &stored_messages,
+                    server_id,
+                    username,
+                    true,
+                );
             }
-            ServerMessage::UserLeft { username } => {
-                append_presence_message(&window, &user_store, &stored_messages, username, false);
+            ServerMessage::UserLeft {
+                server_id,
+                username,
+            } => {
+                append_presence_message(
+                    &window,
+                    &user_store,
+                    &stored_messages,
+                    server_id,
+                    username,
+                    false,
+                );
             }
             ServerMessage::ChatMessage {
+                server_id,
                 channel_id,
                 author,
                 content,
             } => {
                 let stored = StoredMessage {
                     channel_id,
+                    server_id,
                     author: author.clone(),
                     content: content.clone(),
                     timestamp: current_timestamp(),
@@ -1243,7 +1404,44 @@ fn apply_server_message(
                 };
                 append_stored_message(&window, &user_store, &stored_messages, stored);
             }
-            ServerMessage::Channels { channels } => {
+            ServerMessage::ChatServers {
+                servers,
+                active_server_id,
+            } => {
+                let views = servers
+                    .iter()
+                    .map(|server| ChatServerView {
+                        id: server.id.clone().into(),
+                        name: server.name.clone().into(),
+                        icon: profile_image(&server.icon),
+                        has_icon: server.icon.is_some(),
+                        member_count: i32::try_from(server.member_count).unwrap_or(100),
+                        is_member: server.is_member,
+                    })
+                    .collect::<Vec<_>>();
+                window.set_chat_servers(ModelRc::new(VecModel::from(views)));
+                window.set_selected_chat_server_id(active_server_id.clone().into());
+                if active_server_id.is_empty() {
+                    window.set_channels(ModelRc::new(VecModel::from(Vec::<ChannelView>::new())));
+                    window
+                        .set_channel_names(ModelRc::new(VecModel::from(
+                            Vec::<slint::SharedString>::new(),
+                        )));
+                    window.set_selected_channel_id("".into());
+                    window.set_selected_channel_name("".into());
+                    window.set_selected_channel_topic("".into());
+                    window.set_messages(ModelRc::new(VecModel::from(Vec::<Message>::new())));
+                }
+            }
+            ServerMessage::Channels {
+                server_id,
+                channels,
+            } => {
+                if !server_id.is_empty()
+                    && server_id != window.get_selected_chat_server_id().as_str()
+                {
+                    return;
+                }
                 let names = channels
                     .iter()
                     .map(|channel| channel.name.clone().into())
@@ -1258,6 +1456,13 @@ fn apply_server_message(
                     .collect::<Vec<_>>();
                 window.set_channels(ModelRc::new(VecModel::from(views)));
                 window.set_channel_names(ModelRc::new(VecModel::from(names)));
+                if channels.is_empty() {
+                    window.set_selected_channel_id("".into());
+                    window.set_selected_channel_name("".into());
+                    window.set_selected_channel_topic("".into());
+                    window.set_messages(ModelRc::new(VecModel::from(Vec::<Message>::new())));
+                    return;
+                }
                 let selected_id = window.get_selected_channel_id().to_string();
                 if let Some(channel) = channels
                     .iter()
@@ -1288,6 +1493,7 @@ mod tests {
         PREFERRED_ACCENT_KEY, StoredMessage, UserStore, editable_theme_colors, parse_theme_color,
         theme_colors,
     };
+    use crate::protocol;
     use std::collections::HashMap;
 
     #[test]

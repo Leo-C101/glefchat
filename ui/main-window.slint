@@ -20,6 +20,15 @@ export struct ChannelView {
     topic: string,
 }
 
+export struct ChatServerView {
+    id: string,
+    name: string,
+    icon: image,
+    has-icon: bool,
+    member-count: int,
+    is-member: bool,
+}
+
 component ChatScrollView inherits ScrollView {
     in property <int> scroll-request: 0;
 
@@ -35,14 +44,20 @@ export component MainWindow inherits Window {
     min-width: 760px;
     min-height: 560px;
     background: root.theme-colors[23].value;
-    
+
     in-out property <[Message]> messages;
     in-out property <[ChannelView]> channels;
+    in-out property <[ChatServerView]> chat-servers;
     in-out property <[string]> channel-names;
+    in-out property <string> selected-chat-server-id: "";
     in-out property <string> selected-channel-id: "";
     in-out property <string> selected-channel-name: "";
     in-out property <string> selected-channel-topic: "";
     in-out property <bool> channel-management-open: false;
+    in-out property <bool> server-creation-open: false;
+    in-out property <image> new-server-icon;
+    in-out property <bool> new-server-icon-selected: false;
+    in-out property <string> server-icon-error: "";
     in-out property <string> username: "";
     in-out property <bool> logged-in: false;
     in-out property <bool> restoring-session: false;
@@ -69,6 +84,10 @@ export component MainWindow inherits Window {
     in-out property <int> chat-scroll-request: 0;
     callback send-message(string);
     callback select-channel(string);
+    callback select-chat-server(string);
+    callback create-chat-server(string, bool);
+    callback leave-chat-server(string);
+    callback choose-chat-server-icon();
     callback create-channel(string, string);
     callback edit-channel(string, string, string);
     callback login(string, string);
@@ -81,7 +100,7 @@ export component MainWindow inherits Window {
     callback show-user-profile(string);
     callback set-user-role(string, string);
     callback set-user-banned(string, bool);
-    
+
     if !root.logged-in : Rectangle {
         background: root.theme-colors[23].value;
 
@@ -491,7 +510,82 @@ export component MainWindow inherits Window {
             spacing: 14px;
 
             Rectangle {
-                width: 190px;
+                width: 76px;
+                background: root.theme-colors[23].value;
+                border-radius: 10px;
+
+                VerticalBox {
+                    padding: 8px;
+                    spacing: 9px;
+                    alignment: center;
+
+                    ScrollView {
+                        VerticalBox {
+                            spacing: 9px;
+                            alignment: center;
+
+                            for server in root.chat-servers : VerticalBox {
+                                spacing: 3px;
+                                alignment: center;
+
+                                Rectangle {
+                                    width: 48px;
+                                    height: 48px;
+                                    background: root.theme-colors[21].value;
+                                    border-radius: 24px;
+                                    border-width: server.id == root.selected-chat-server-id ? 2px : 0px;
+                                    border-color: root.theme-colors[13].value;
+                                    clip: true;
+
+                                    if server.has-icon : Image {
+                                        source: server.icon;
+                                        width: parent.width;
+                                        height: parent.height;
+                                        image-fit: cover;
+                                    }
+
+                                    if !server.has-icon : Text {
+                                        text: "●";
+                                        color: root.theme-colors[13].value;
+                                        font-size: 22px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+
+                                    TouchArea {
+                                        width: parent.width;
+                                        height: parent.height;
+                                        enabled: server.is-member || server.member-count < 100;
+                                        clicked => { root.select-chat-server(server.id); }
+                                    }
+                                }
+
+                                Text {
+                                    text: server.name;
+                                    width: 60px;
+                                    font-size: 10px;
+                                    color: root.theme-colors[14].value;
+                                    horizontal-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+                    }
+
+                    Button {
+                        text: "+";
+                        width: 48px;
+                        height: 42px;
+                        clicked => {
+                            root.server-creation-open = !root.server-creation-open;
+                            root.server-icon-error = "";
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                width: 196px;
                 background: root.theme-colors[22].value;
                 border-radius: 10px;
 
@@ -499,14 +593,88 @@ export component MainWindow inherits Window {
                     padding: 10px;
                     spacing: 8px;
 
-                    Text {
-                        text: "Channels";
-                        font-size: 16px;
-                        font-weight: 700;
-                        color: root.theme-colors[13].value;
+                    HorizontalBox {
+                        Text {
+                            text: root.server-creation-open ? "New server" : "Channels";
+                            font-size: 15px;
+                            font-weight: 700;
+                            color: root.theme-colors[13].value;
+                            vertical-alignment: center;
+                        }
+
+                        Rectangle { }
+
+                        if root.selected-chat-server-id != "" && !root.server-creation-open : Button {
+                            text: "Leave";
+                            clicked => { root.leave-chat-server(root.selected-chat-server-id); }
+                        }
                     }
 
-                    ScrollView {
+                    if root.server-creation-open : VerticalBox {
+                        spacing: 7px;
+
+                        new_server_name_input := LineEdit {
+                            placeholder-text: "Server name";
+                        }
+
+                        HorizontalBox {
+                            spacing: 7px;
+
+                            Rectangle {
+                                width: 38px;
+                                height: 38px;
+                                background: root.theme-colors[21].value;
+                                border-radius: 19px;
+                                clip: true;
+
+                                if root.new-server-icon-selected : Image {
+                                    source: root.new-server-icon;
+                                    width: parent.width;
+                                    height: parent.height;
+                                    image-fit: cover;
+                                }
+                            }
+
+                            Button {
+                                text: "Choose icon";
+                                clicked => { root.choose-chat-server-icon(); }
+                            }
+                        }
+
+                        if root.server-icon-error != "" : Text {
+                            text: root.server-icon-error;
+                            color: root.theme-colors[4].value;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalBox {
+                            spacing: 6px;
+
+                            Button {
+                                text: "Cancel";
+                                clicked => {
+                                    root.server-creation-open = false;
+                                    root.new-server-icon-selected = false;
+                                    root.server-icon-error = "";
+                                }
+                            }
+
+                            Button {
+                                text: "Create";
+                                enabled: new_server_name_input.text != "";
+                                clicked => {
+                                    root.create-chat-server(new_server_name_input.text, root.new-server-icon-selected);
+                                    new_server_name_input.text = "";
+                                    root.new-server-icon-selected = false;
+                                    root.server-icon-error = "";
+                                    root.server-creation-open = false;
+                                }
+                            }
+                        }
+                    }
+
+                    if !root.server-creation-open : ScrollView {
                         VerticalBox {
                             spacing: 4px;
 
